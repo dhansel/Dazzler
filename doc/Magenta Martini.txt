@@ -1,0 +1,20 @@
+The magmartini.ptp file is a capture of the input sequence for the
+Magenta Martini (created by Steve Dompier) animation.
+
+This was meant to be played back from paper tape on a TeleType, so
+it needs to be played back SLOWLY, otherwise some input will be 
+missed and the animation does not work.
+
+To play this animation:
+- In the AltairDuino's SIO configuration, change the
+  "SIO board revision" setting to "Cromemco"
+- start DazzleMation on the AltairDuino
+- connect via TeraTerm to AltairDuino SIO board
+- select "Setup->Serial Port" in TeraTerm and set Transmit Delay
+  to at least 50 msec/char
+- select "File->Send file..." in TeraTerm, make sure the BINARY
+  option is checked, select the magmartini.ptp file and click "Open"
+- the animation is constructed slowly as the data is sent
+- after construction is finished (cursor moves to center of screen)
+  you can use SW15-SW8 to set the animation speed
+  (all up except SW8 seems to be a good speed)

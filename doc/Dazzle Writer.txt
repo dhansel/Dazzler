@@ -1,0 +1,28 @@
+The SW14-SW12 sense switches control the video mode
+(Dazzler output register 0Fh):
+
+SW14: up: single-color,    down: multi-color
+SW13: up: 2k video memory, down: 512-byte video memory
+SW12: up: color,           down: grayscale
+SW11: background color (intensity)
+SW10: background color (blue)
+SW 9: background color (green)
+SW 8: background color (red)
+
+Initially all switches should be UP to get a proper picture.
+From there you can experiment. Note that if SW14 is down the text
+becomes unreadable and if SW13 is down then only the top-left
+quadrant is shown.
+
+
+Recognized control keys:
+------------------------
+CTRL-N: cursor up
+CTRL-J: cursor down
+CTRL-O: cursor right
+CTRL-H: cursor left
+
+CTRL-M: carriage return
+CTRL-K: clear screen
+
+CTRL-I: (followed by 0 or 1) enable/disable inverse display
