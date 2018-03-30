@@ -1,3 +1,4 @@
+Expects input (and sends output to) first port of 2SIO card.
 Actual keys differ from description in manual:
 
 Manual    Actual    Function
