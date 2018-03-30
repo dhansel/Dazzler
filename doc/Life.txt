@@ -1,0 +1,16 @@
+Actual keys differ from description in manual:
+
+Manual    Actual    Function
+--------------------------------------------------
+C         ?         move cursor
+D         CTRL-A    deposit data and move cursor
+E         CTRL-B    erase data and move cursor
+W         CTRL-N    move cursor up
+Z         CTRL-O    move cursor down
+A         CTRL-H    move cursor left
+S         CTRL-I    move cursor right
+RETURN    RETURN    move cursor to the left edge
+Q         CTRL-K    move cursor home
+G         CTRL-D    go (starts the evolution)
+F         F         freeze (pause until space bar is pressed)
+CTRL-X    S         kill the entire colony and start over
