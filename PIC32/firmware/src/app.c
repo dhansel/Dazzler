@@ -489,7 +489,7 @@ void draw_joystick_buttons(uint8_t buttons)
 
 void draw_test_screen()
 {
-  int q, r, c;
+  int r, c;
   switch( test_mode )
     {
     case 1:
@@ -512,19 +512,17 @@ void draw_test_screen()
     case 11:
       // color test pattern
       ColorOn();
-      for(q=0; q<4; q++)
-        for(r=0; r<16; r++)
-          for(c=0; c<8; c++)
-            update_byte(q*128+r*8+c, ((r+c)&7) + 16*(((r+c)&7)+8));
+      for(r=0; r<32; r++)
+        for(c=0; c<16; c++)
+          update_byte_smallmem_multi(r*16+c, ((r+c)&7) + 16*(((r+c)&7)+8));
       break;
                         
     case 12:
       // gray-scale test pattern
       ColorOff();
-      for(q=0; q<4; q++)
-        for(r=0; r<16; r++)
-          for(c=0; c<8; c++)
-            update_byte(q*128+r*8+c, ((r+c*2)&15) + 16*((r+c*2+1)&15));
+      for(r=0; r<32; r++)
+        for(c=0; c<16; c++)
+          update_byte_smallmem_multi(r*16+c, ((r+c*2)&15) + 16*((r+c*2+1)&15));
       break;
                       
     case 13:
