@@ -759,9 +759,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
         byte msg[3];
 
         if( uMsg==MM_JOY1MOVE || uMsg==MM_JOY1BUTTONUP || uMsg==MM_JOY1BUTTONDOWN ) 
-          msg[0] = DAZ_JOY2;
-        else
           msg[0] = DAZ_JOY1;
+        else
+          msg[0] = DAZ_JOY2;
 
         if( !(wParam & JOY_BUTTON1) ) msg[0] |= 1;
         if( !(wParam & JOY_BUTTON2) ) msg[0] |= 2;
