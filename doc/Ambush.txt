@@ -1,0 +1,19 @@
+Ambush
+======
+
+Take pot shots at an enemy convoy.
+Requires one joystick (in joystick port 2).
+
+splash screen controls:
+-----------------------
+button 2: enable targeting sight
+button 3: disable targeting sight
+button 4: start game
+button 1+3: switch to (slightly) harder play level (no visual confirmation)
+
+during game:
+------------
+- shoot by pressing button 1
+- motorcycles are 700 points each, jeeps 300, tanks 100
+- hitting "UN" vehicles causes a 3 second penalty
+- bonus time at 8500 points
