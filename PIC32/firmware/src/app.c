@@ -145,8 +145,9 @@ uint8_t dazzler_picture_ctrl = 0x10;
 uint8_t framebuffer[128][132] __attribute__((aligned(32)));
 
 
-// dazzler video memory, really only necessary so we can update the
-// frame buffer properly if the dazzler_picture_ctrl register is changed
+// dazzler video memory, necessary so we can update the frame buffer properly 
+// if the dazzler_picture_ctrl register is changed and to avoid re-drawing
+// the framebuffer for bytes that have not changed
 uint8_t dazzler_mem[2048];
 
 
@@ -327,13 +328,6 @@ void set_update_byte()
 }
 
 
-void update_frame()
-{
-  int i, w = (dazzler_picture_ctrl & 0x20) ? 2048 : 512;
-  for(i=0; i<w; i++) update_byte(i, dazzler_mem[i]);
-}
-
-
 void dazzler_receive(uint8_t data)
 {
   static int state = ST_IDLE, addr, cnt;
@@ -372,8 +366,7 @@ void dazzler_receive(uint8_t data)
       break;
 
     case ST_MEMBYTE2:
-      update_byte(addr, data);
-      dazzler_mem[addr] = data;
+      if( data != dazzler_mem[addr] ) { update_byte(addr, data); dazzler_mem[addr] = data; }
       state = ST_IDLE;
       break;
 
@@ -393,25 +386,38 @@ void dazzler_receive(uint8_t data)
     case ST_CTRLPIC:
       if( data != dazzler_picture_ctrl )
         {
-          // must redraw the frame if
-          // either the resolution or memory size setting has changed or
-          // we are in 4x resolution mode and the (common) color has changed
-          bool redraw_frame = (data & 0x60)!=(dazzler_picture_ctrl & 0x60) || 
-            ((dazzler_picture_ctrl & 0x40) && (data & 0x0f)!=(dazzler_picture_ctrl & 0x0f));
-                 
-          dazzler_picture_ctrl = data;
-          set_update_byte();
-          if( redraw_frame ) update_frame();
+          if( data != dazzler_picture_ctrl )
+            {
+              uint8_t ctrl = dazzler_picture_ctrl;
+              dazzler_picture_ctrl = data;
+              set_update_byte();
 
-          ColorStateSet((dazzler_picture_ctrl & 0x10)!=0);
+              if( (data & 0x20)!=(ctrl & 0x20) )
+                {
+                  // redraw the full frame if memory size setting has changed
+                  int i, w = (dazzler_picture_ctrl & 0x20) ? 2048 : 512;
+                  for(i=0; i<w; i++) update_byte(i, dazzler_mem[i]);
+                }
+              else if( (data & 0x40)!=(ctrl & 0x40) || ((ctrl & 0x40) && (data & 0x0f)!=(ctrl & 0x0f)) )
+                {
+                  // redraw only the foreground if the 1x/4x resolution setting has changed or
+                  // we are in 4x resolution mode and the (common) color has changed
+                  int i, w = (dazzler_picture_ctrl & 0x20) ? 2048 : 512;
+                  for(i=0; i<w; i++)
+                    if( dazzler_mem[i]!=0 )
+                      update_byte(i, dazzler_mem[i]);
+                }
+
+              ColorStateSet((dazzler_picture_ctrl & 0x10)!=0);
+            }
         }
 
       state = ST_IDLE;
       break;
 
     case ST_FULLFRAME:
-      update_byte(addr, data);
-      dazzler_mem[addr++] = data;
+      if( data != dazzler_mem[addr] ) { update_byte(addr, data); dazzler_mem[addr] = data;}
+      addr++;
       if( --cnt==0 ) state = ST_IDLE; 
       break;
     }

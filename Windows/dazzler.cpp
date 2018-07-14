@@ -57,7 +57,7 @@ byte ctrl = 0;
 
 HBRUSH brushes_color[16], brushes_grayscale[16];
 
-byte dazzler_mem[2048];
+byte dazzler_mem[2048], dazzler_newframe[2048];
 
 int    g_com_port = -1;
 int    g_com_baud = 1050000;
@@ -69,7 +69,8 @@ SOCKET server_socket = INVALID_SOCKET;
 HANDLE draw_mutex = INVALID_HANDLE_VALUE;
 
 int pixel_scaling = 1, border_topbottom = 0, border_leftright = 0;
-int joy1_x = 0, joy1_y = 0, joy1_buttons = 0x0f;
+int g_joy_swap = 0, g_joy_show = 0;
+byte g_joy1[3], g_joy2[3];
 
 
 static void draw_pixel(HDC dc, byte x, byte y, byte w, byte color)
@@ -131,7 +132,7 @@ static void update_byte(HDC dc, int i)
 }
 
 
-static void update_frame(HWND hwnd)
+static void update_frame(HWND hwnd, byte *newframe = NULL)
 {
   WaitForSingleObject(draw_mutex, INFINITE);
 
@@ -139,7 +140,19 @@ static void update_frame(HWND hwnd)
   if( ctrl & 0x80 ) 
     {
       int w = (picture_ctrl & 0x20) ? 2048 : 512;
-      for(int i=0; i<w; i++) update_byte(hdc, i);
+      if( newframe==NULL )
+        {
+          for(int i=0; i<w; i++) update_byte(hdc, i);
+        }
+      else
+        {
+          for(int i=0; i<w; i++)
+            if( newframe[i] != dazzler_mem[i] )
+              {
+                dazzler_mem[i] = newframe[i];
+                update_byte(hdc, i);
+              }
+        }
     }
   else
     {
@@ -149,6 +162,22 @@ static void update_frame(HWND hwnd)
     }
   ReleaseDC(hwnd, hdc);
 
+  ReleaseMutex(draw_mutex);
+}
+
+
+static void update_foreground(HWND hwnd)
+{
+  int w = (picture_ctrl & 0x20) ? 2048 : 512;
+  WaitForSingleObject(draw_mutex, INFINITE);
+  HDC hdc = GetDC(hwnd);
+
+  if( ctrl & 0x80 )
+    for(int i=0; i<w; i++)
+      if( dazzler_mem[i]!=0 )
+        update_byte(hdc, i);
+
+  ReleaseDC(hwnd, hdc);
   ReleaseMutex(draw_mutex);
 }
 
@@ -167,7 +196,20 @@ void set_window_title(HWND hwnd)
              g_com_port, connected ? L"" : L"not ", on ? L"on" : L"off");
   else
     wsprintf(buf, L"Dazzler Display");
-  
+
+  if( g_joy_show )
+    {
+      wchar_t buf2[100];
+      wsprintf(buf2, L" --- J1:%s%s%s%s%s%s J2:%s%s%s%s%s%s",
+               (char) g_joy1[2]>32 ? L"U" : (char) g_joy1[2]<-32 ? L"D" : L"",
+               (char) g_joy1[1]>32 ? L"R" : (char) g_joy1[1]<-32 ? L"L" : L"",
+			   g_joy1[0] & 0x01 ? L"" : L"1", g_joy1[0] & 0x02 ? L"" : L"2", g_joy1[0] & 0x04 ? L"" : L"3", g_joy1[0] & 0x08 ? L"" : L"4",
+               (char) g_joy2[2]>32 ? L"U" : (char) g_joy2[2]<-32 ? L"D" : L"",
+               (char) g_joy2[1]>32 ? L"R" : (char) g_joy2[1]<-32 ? L"L" : L"",
+			   g_joy2[0] & 0x01 ? L"" : L"1", g_joy2[0] & 0x02 ? L"" : L"2", g_joy2[0] & 0x04 ? L"" : L"3", g_joy2[0] & 0x08 ? L"" : L"4");
+      wcscat_s(buf, buf2);
+    }
+
   SetWindowText(hwnd, buf);
 }
 
@@ -185,7 +227,7 @@ void dazzler_receive(HWND hwnd, byte *data, int size)
           int n = recv_bytes > (size-i) ? (size-i) : recv_bytes;
 
           if( recv_status==DAZ_FULLFRAME )
-            memcpy(dazzler_mem+recv_ptr, data+i, n);
+            memcpy(dazzler_newframe+recv_ptr, data+i, n);
           else
             memcpy(buf+recv_ptr, data+i, n);
 
@@ -197,39 +239,54 @@ void dazzler_receive(HWND hwnd, byte *data, int size)
             {
               switch( recv_status )
                 {
-                case DAZ_FULLFRAME: 
-                  if( ctrl & 0x80 ) update_frame(hwnd);
+                case DAZ_FULLFRAME:
+                  if( ctrl & 0x80 ) update_frame(hwnd, dazzler_newframe);
                   break;
                   
                 case DAZ_MEMBYTE:
                   {
                     int a = buf[0]*256+buf[1];
-                    dazzler_mem[a] = buf[2];
-
-                    if( ctrl & 0x80 ) 
+                    if( dazzler_mem[a] != buf[2] )
                       {
-                        WaitForSingleObject(draw_mutex, INFINITE);
-                        HDC hdc = GetDC(hwnd);
-                        update_byte(hdc, a);
-                        ReleaseDC(hwnd, hdc);
-                        ReleaseMutex(draw_mutex);
+                        dazzler_mem[a] = buf[2];
+                        if( ctrl & 0x80 )
+                          {
+                            WaitForSingleObject(draw_mutex, INFINITE);
+                            HDC hdc = GetDC(hwnd);
+                            update_byte(hdc, a);
+                            ReleaseDC(hwnd, hdc);
+                            ReleaseMutex(draw_mutex);
+                          }
                       }
 
                     break;
                   }
                   
                 case DAZ_CTRL:
-                  ctrl = buf[0];
-                  update_frame(hwnd);
-                  set_window_title(hwnd);
+                  if( (ctrl&0x80) != (buf[0]&0x80) )
+                    {
+                      ctrl = buf[0];
+                      update_frame(hwnd);
+                      set_window_title(hwnd);
+                    }
                   break;
 
                 case DAZ_CTRLPIC:
-			      if( picture_ctrl != buf[0] )
-				  {
-                    picture_ctrl = buf[0];
-                    update_frame(hwnd);
-				  }
+                  if( picture_ctrl != buf[0] )
+                    {
+                      if( (picture_ctrl & 0x20) != (buf[0] & 0x20) )
+                        {
+                          // memory size changed => redraw everything
+                          picture_ctrl = buf[0];
+                          update_frame(hwnd);
+                        }
+                      else
+                        {
+                          // color settings changed => only redraw foreground
+                          picture_ctrl = buf[0];
+                          update_foreground(hwnd);
+                        }
+                    }
                   break;
                 }
 
@@ -286,6 +343,8 @@ enum
     ID_FULLSCREEN,
     ID_ABOUT,
     ID_EXIT,
+    ID_JOY_SWAP,
+    ID_JOY_SHOW,
     ID_BAUD_9600,
     ID_BAUD_38400,
     ID_BAUD_115200,
@@ -356,13 +415,15 @@ SOCKET connect_socket(HWND hwnd, const wchar_t *server)
 }
 
 
-void write_settings(int port, int baud)
+void write_settings()
 {
   HKEY key;
   if( RegCreateKeyEx(HKEY_CURRENT_USER, L"Software\\DazzlerDisplay", 0, NULL, REG_OPTION_NON_VOLATILE, KEY_SET_VALUE, NULL, &key, NULL) == ERROR_SUCCESS )
     {
-      RegSetValueEx(key, L"Port", 0, REG_DWORD, (const LPBYTE) &port, 4);
-      RegSetValueEx(key, L"Baud", 0, REG_DWORD, (const LPBYTE) &baud, 4);
+      RegSetValueEx(key, L"Port", 0, REG_DWORD, (const LPBYTE) &g_com_port, 4);
+      RegSetValueEx(key, L"Baud", 0, REG_DWORD, (const LPBYTE) &g_com_baud, 4);
+      RegSetValueEx(key, L"SwapJoysticks", 0, REG_DWORD, (const LPBYTE) &g_joy_swap, 4);
+      RegSetValueEx(key, L"ShowJoysticks", 0, REG_DWORD, (const LPBYTE) &g_joy_show, 4);
       RegCloseKey(key);
     }
 }
@@ -378,7 +439,9 @@ bool read_settings(int *port, int *baud)
     {
       if( RegQueryValueEx(key, L"Port", 0, &tp, (LPBYTE) port, &l) == ERROR_SUCCESS && tp==REG_DWORD ) 
         if( RegQueryValueEx(key, L"Baud", 0, &tp, (LPBYTE) baud, &l) == ERROR_SUCCESS && tp==REG_DWORD ) 
-          res = true;
+          if( RegQueryValueEx(key, L"SwapJoysticks", 0, &tp, (LPBYTE) &g_joy_swap, &l) == ERROR_SUCCESS && tp==REG_DWORD )
+            if( RegQueryValueEx(key, L"ShowJoysticks", 0, &tp, (LPBYTE) &g_joy_show, &l) == ERROR_SUCCESS && tp==REG_DWORD )
+              res = true;
 
       RegCloseKey(key);
     }
@@ -401,7 +464,7 @@ void set_baud_rate(HWND hwnd, int baud)
   g_com_baud = baud;
   HMENU menuBaud = GetSubMenu(GetSubMenu(GetMenu(hwnd), 2), 1);
   CheckMenuRadioItem(menuBaud, ID_BAUD_9600, ID_BAUD_1050000, id, MF_BYCOMMAND);
-  write_settings(g_com_port, g_com_baud);
+  write_settings();
 }
 
 
@@ -418,7 +481,7 @@ void set_com_port(HWND hwnd, int port)
     }
 
   set_window_title(hwnd);
-  if( g_com_port>0 ) write_settings(g_com_port, g_com_baud);
+  if( g_com_port>0 ) write_settings();
 }
 
 
@@ -668,6 +731,29 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
           case ID_BAUD_750000:  set_baud_rate(hwnd, 750000); break;
           case ID_BAUD_1050000: set_baud_rate(hwnd, 1050000); break;
 
+          case ID_JOY_SWAP:
+            {
+              g_joy_swap = !g_joy_swap;
+              CheckMenuItem(GetSubMenu(GetMenu(hwnd), 2), ID_JOY_SWAP, MF_BYCOMMAND | (g_joy_swap ? MF_CHECKED : MF_UNCHECKED));
+              write_settings();
+
+              byte b[2];
+              memcpy(b, g_joy1+1, 2); memcpy(g_joy1+1, g_joy2+1, 2); memcpy(g_joy2+1, b, 2);
+              dazzler_send(hwnd, g_joy1, 3);
+              dazzler_send(hwnd, g_joy2, 3);
+              if( g_joy_show ) set_window_title(hwnd);
+              break;
+            }
+
+          case ID_JOY_SHOW:
+            {
+              g_joy_show = !g_joy_show;
+              CheckMenuItem(GetSubMenu(GetMenu(hwnd), 2), ID_JOY_SHOW, MF_BYCOMMAND | (g_joy_show ? MF_CHECKED : MF_UNCHECKED));
+              write_settings();
+              set_window_title(hwnd);
+              break;
+            }
+
           case ID_ABOUT:
             MessageBox(hwnd, 
                        L"Cromemco Dazzler Display application for\nArduino Altair 88000 simulator\n\n"
@@ -707,6 +793,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
       {
         if( wParam==6 || (wParam==27 && (GetWindowLong(hwnd, GWL_STYLE)&WS_OVERLAPPEDWINDOW)==0) )
           toggle_fullscreen(hwnd);
+        else if( wParam==10 )
+          WindowProc(hwnd, WM_COMMAND, ID_JOY_SWAP, 0);
 
         byte msg[2];
         msg[0] = DAZ_KEY;
@@ -758,7 +846,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
       {
         byte msg[3];
 
-        if( uMsg==MM_JOY1MOVE || uMsg==MM_JOY1BUTTONUP || uMsg==MM_JOY1BUTTONDOWN ) 
+        if( (uMsg==MM_JOY1MOVE || uMsg==MM_JOY1BUTTONUP || uMsg==MM_JOY1BUTTONDOWN) ^ g_joy_swap )
           msg[0] = DAZ_JOY1;
         else
           msg[0] = DAZ_JOY2;
@@ -772,6 +860,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
         msg[2] = get_joy_value(0xFFFF-HIWORD(lParam));
 
         dazzler_send(hwnd, msg, 3);
+        memcpy((msg[0] & 0xF0)==DAZ_JOY1 ? g_joy1 : g_joy2, msg, 3);
+        if( g_joy_show ) set_window_title(hwnd);
         break;
       }
 
@@ -858,6 +948,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR pCmdLine, int nCmdShow
     HMENU menuSettings = CreateMenu();
     AppendMenu(menuSettings, MF_POPUP, (UINT_PTR) menuPort, L"&Port");
     AppendMenu(menuSettings, MF_POPUP, (UINT_PTR) menuBaud, L"&Baud Rate");
+    AppendMenu(menuSettings, MF_BYPOSITION | MF_STRING, ID_JOY_SWAP, L"Swap &Joysticks\tCtrl+J");
+    AppendMenu(menuSettings, MF_BYPOSITION | MF_STRING, ID_JOY_SHOW, L"&Show Joysticks");
     HMENU menuHelp = CreateMenu();
     AppendMenu(menuHelp, MF_BYPOSITION | MF_STRING, ID_ABOUT, L"&About");
 
@@ -878,6 +970,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR pCmdLine, int nCmdShow
       set_com_port(hwnd, p);
 
     set_baud_rate(hwnd, baud);
+    CheckMenuItem(GetSubMenu(GetMenu(hwnd), 2), ID_JOY_SWAP, MF_BYCOMMAND | (g_joy_swap ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(GetSubMenu(GetMenu(hwnd), 2), ID_JOY_SHOW, MF_BYCOMMAND | (g_joy_show ? MF_CHECKED : MF_UNCHECKED));
+    g_joy1[0]=DAZ_JOY1 | 0x0f; g_joy1[1]=0x00; g_joy1[2]=0x00;
+    g_joy2[0]=DAZ_JOY2 | 0x0f; g_joy2[1]=0x00; g_joy2[2]=0x00;
+    memset(dazzler_mem, 0, 2048);
 
     if( g_com_port>0 || wcslen(pCmdLine)==0 )
       {
@@ -914,11 +1011,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR pCmdLine, int nCmdShow
         DispatchMessage(&msg);
       }
 
-	if( server_socket!=INVALID_SOCKET )
-	{
-	  shutdown(server_socket, SD_SEND);
-      closesocket(server_socket);
-	}
+    if( server_socket!=INVALID_SOCKET )
+      {
+        shutdown(server_socket, SD_SEND);
+        closesocket(server_socket);
+      }
 
     return 0;
 }
