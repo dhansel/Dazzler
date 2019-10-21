@@ -17,7 +17,6 @@
 // Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 // -----------------------------------------------------------------------------
 
-
 #include "app.h"
 
 #include "peripheral/oc/plib_oc.h"
@@ -26,7 +25,6 @@
 #include "peripheral/adc/plib_adc.h"
 #include "peripheral/usart/plib_usart.h"
 
-
 // If 1, talk to Arduino Due Native port via USB. Pins 21 and 22 are USB D+/D- pins
 // If 0, talk to a 3.3v serial connection 750000 baud 8N1. Pins 21 and 22 are TX and RX
 #define USE_USB 1
@@ -34,6 +32,10 @@
 // 0=do not produce any signals unless Dazzler control register is set to "on"
 // 1=produce sync signals but black screen if Dazzler control register is off
 #define ALWAYS_ON 1
+
+// If 1, visualize the current ringbuffer usage on the top of the screen
+// If 0, do not visualize
+#define SHOW_RINGBUFFER 0
 
 
 // The following Microchip USB host stack source files have been modified from their original:
@@ -44,17 +46,9 @@
 //
 // File: firmware\src\system_config\default\framework\usb\src\dynamic\usb_host.c
 // added line 5391: if( transferType==USB_TRANSFER_TYPE_BULK && maxPacketSize>64 ) maxPacketSize=64;
-//(Arduino Due always sends the high speed descriptor when configuration is requested, should
+// (Arduino Due always sends the high speed descriptor when configuration is requested, should
 // send full speed descriptor if the host is full speed. Will send full speed descriptor when OTHER 
 // configuration is requested. maxPacketSize for full speed bulk transfer is 64 bytes, high speed is 512)
-// 
-// File: firmware\src\system_config\default\framework\driver\usb\usbfs\src\dynamic\drv_usbfs_host.c
-// added starting in line 1713:
-// if( ++pipe->nakCounter>=10 )
-//   { pIRP->status = USB_HOST_IRP_STATUS_COMPLETED_SHORT; pipe->nakCounter = 0; endIRP = true; }
-//  else
-//  (to end a read request if no data is received after waiting for 10ms, necessary
-//   so we can still send joystick data when the Arduino is not sending)
 
 
 // VGA picture generation: We produce the timings for a SVGA 800x600 picture.
@@ -109,9 +103,9 @@
 // The 800x600 resolution gives us 600 visible lines but we only need 512
 // (Dazzler has 128 lines which we scale up by 4). So there are 88 lines
 // of margin, which we split between the front and back porches.
-#define NUM_LINES     628               // =16.59ms/frame (spec: 16.579ms)
-#define VFP_LENGTH    (1+44)            // front porch plus margin
-#define VBP_LENGTH    (23+44) 	        // back porch plus margin
+#define NUM_LINES     630               // =16.59ms/frame (spec: 16.579ms)
+#define VFP_LENGTH    (1+45)            // front porch plus margin
+#define VBP_LENGTH    (23+45) 	        // back porch plus margin
 #define VSYNC_LENGTH  4                 // =0.10567ms (spec: 0.1056ms)
 #define DISPLAY_LINES (128*4)
 
@@ -122,47 +116,46 @@
 
 
 // current scan line
-volatile int g_current_line = 0;
+volatile uint32_t g_current_line = 0, g_frame_ctr = 0;
 
+// flag to indicate to main function that VSYNC should be sent
+volatile bool send_vsync = false;
 
 // Dazzler control register:
 // D7: on/off
 // D6-D0: screen memory location (not used in client)
 uint8_t dazzler_ctrl = 0x00;
 
-
 // Dazzler picture control register:
 // D7: not used
 // D6: 1=resolution x4, 0=normal resolution
 // D5: 1=2k memory, 0=512byte memory
 // D4: 1=color, 0=monochrome
-// D3-D0: color info for x4 high res mode
+// D3-D0: foreground color for x4 high res mode
 uint8_t dazzler_picture_ctrl = 0x10;
 
-
-// frame buffer has 128 lines of 128+1 columns (one extra 0 at the end)
-// (use 132 bytes per line to stay 32-bit aligned)
-uint8_t framebuffer[128][132] __attribute__((aligned(32)));
-
-
-// dazzler video memory, necessary so we can update the frame buffer properly 
-// if the dazzler_picture_ctrl register is changed and to avoid re-drawing
-// the framebuffer for bytes that have not changed
-uint8_t dazzler_mem[2048];
-
+// dazzler video memory, keeping two buffers plus one current-frame buffer
+uint8_t dazzler_mem[2 * 2048], dazzler_mem_buf[2048];
 
 // test mode (see function draw_test_screen)
 int test_mode = 0;
+
+// computer/dazzler version
+#define DAZZLER_VERSION 0x01
+int computer_version =  0x00;
 
 // dazzler commands received from the Altair simulator
 #define DAZ_MEMBYTE   0x10
 #define DAZ_FULLFRAME 0x20
 #define DAZ_CTRL      0x30
 #define DAZ_CTRLPIC   0x40
+#define DAZ_VERSION   0xF0
 
 // dazzler commands sent to the Altair simulator
 #define DAZ_JOY1      0x10
 #define DAZ_JOY2      0x20
+#define DAZ_KEY       0x30
+#define DAZ_VSYNC     0x40
 
 // receiver states
 #define ST_IDLE      0
@@ -173,297 +166,140 @@ int test_mode = 0;
 #define ST_FULLFRAME 5
 
 
-// -----------------------------------------------------------------------------
-// --------------- display routines (updating the frame buffer) ----------------
-// -----------------------------------------------------------------------------
-
-
-void update_byte_bigmem_single(int i, uint8_t b)
-{
-  // 2K RAM, high resolution (128x128 pixels, common color)
-  int x, y;
-  uint8_t color, *fb;
-
-  // determine position within quadrant
-  x = (i & 0x000f)*4;
-  y = (i & 0x01f0)/8;
-
-  // determine quadrant
-  if( i & 0x0200 ) x += 64;
-  if( i & 0x0400 ) y += 64; 
-
-  fb    = &(framebuffer[y][x]);
-  color = dazzler_picture_ctrl & 0x0f;
-
-  fb[0] = b & 0x01 ? color : 0;
-  fb[1] = b & 0x02 ? color : 0;
-  fb[2] = b & 0x10 ? color : 0;
-  fb[3] = b & 0x20 ? color : 0;
-  fb += sizeof(framebuffer[0]); // next line
-  fb[0] = b & 0x04 ? color : 0;
-  fb[1] = b & 0x08 ? color : 0;
-  fb[2] = b & 0x40 ? color : 0;
-  fb[3] = b & 0x80 ? color : 0;
-}
-
-
-void update_byte_bigmem_multi(int i, uint8_t b)
-{
-  // 2K RAM, low resolution (64x64 pixels, individual color)
-  int x, y;
-  uint8_t color1, color2, *fb; 
-
-  // determine position within quadrant
-  x = (i & 0x000f)*4;
-  y = (i & 0x01f0)/8;
-
-  // determine quadrant
-  if( i & 0x0200 ) x += 64;
-  if( i & 0x0400 ) y += 64; 
-
-  fb     = &(framebuffer[y][x]);
-  color1 = b & 0x0f;
-  color2 = (b & 0xf0)/16;
-
-  fb[0] = color1; fb[1] = color1;
-  fb[2] = color2; fb[3] = color2;
-  fb += sizeof(framebuffer[0]); // next line
-  fb[0] = color1; fb[1] = color1;
-  fb[2] = color2; fb[3] = color2;
-}
-
-
-void update_byte_smallmem_single(int i, uint8_t b)
-{
-  // 512 bytes RAM, high resolution (64x64 pixels, common color)
-  int x, y;
-  uint8_t color, *fb;
-  uint8_t color0, color1, color2, color3, color4, color5, color6, color7;
-
-  // determine position
-  x = (i & 0x000f)*8;
-  y = (i & 0x01f0)/4;
-
-  fb     = &(framebuffer[y][x]);
-  color  = dazzler_picture_ctrl & 0x0f;
-  color0 = b & 0x01 ? color : 0;
-  color1 = b & 0x02 ? color : 0;
-  color2 = b & 0x04 ? color : 0;
-  color3 = b & 0x08 ? color : 0;
-  color4 = b & 0x10 ? color : 0;
-  color5 = b & 0x20 ? color : 0;
-  color6 = b & 0x40 ? color : 0;
-  color7 = b & 0x80 ? color : 0;
-
-  fb[0] = color0; fb[1] = color0;
-  fb[2] = color1; fb[3] = color1;
-  fb[4] = color4; fb[5] = color4;
-  fb[6] = color5; fb[7] = color5;
-  fb += sizeof(framebuffer[0]); // next line
-  fb[0] = color0; fb[1] = color0;
-  fb[2] = color1; fb[3] = color1;
-  fb[4] = color4; fb[5] = color4;
-  fb[6] = color5; fb[7] = color5;
-  fb += sizeof(framebuffer[0]); // next line
-  fb[0] = color2; fb[1] = color2;
-  fb[2] = color3; fb[3] = color3;
-  fb[4] = color6; fb[5] = color6;
-  fb[6] = color7; fb[7] = color7;
-  fb += sizeof(framebuffer[0]); // next line
-  fb[0] = color2; fb[1] = color2;
-  fb[2] = color3; fb[3] = color3;
-  fb[4] = color6; fb[5] = color6;
-  fb[6] = color7; fb[7] = color7;
-}
-
-
-
-void update_byte_smallmem_multi(int i, uint8_t b)
-{
-  // 512 bytes RAM, low resolution (32x32 pixels, individual color)
-  int x, y;
-  uint8_t color1, color2, *fb;
-
-  // determine position
-  x = (i & 0x000f)*8;
-  y = (i & 0x01f0)/4;
-
-  fb     = &(framebuffer[y][x]);
-  color1 = b & 0x0f;
-  color2 = (b & 0xf0)/16;
-
-  fb[0] = color1; fb[1] = color1;
-  fb[2] = color1; fb[3] = color1;
-  fb[4] = color2; fb[5] = color2;
-  fb[6] = color2; fb[7] = color2;
-  fb += sizeof(framebuffer[0]); // next line
-  fb[0] = color1; fb[1] = color1;
-  fb[2] = color1; fb[3] = color1;
-  fb[4] = color2; fb[5] = color2;
-  fb[6] = color2; fb[7] = color2;
-  fb += sizeof(framebuffer[0]); // next line
-  fb[0] = color1; fb[1] = color1;
-  fb[2] = color1; fb[3] = color1;
-  fb[4] = color2; fb[5] = color2;
-  fb[6] = color2; fb[7] = color2;
-  fb += sizeof(framebuffer[0]); // next line
-  fb[0] = color1; fb[1] = color1;
-  fb[2] = color1; fb[3] = color1;
-  fb[4] = color2; fb[5] = color2;
-  fb[6] = color2; fb[7] = color2;
-}
-
-
-void (*update_byte)(int, uint8_t) = &update_byte_smallmem_multi;
-
-void set_update_byte()
-{
-  switch( dazzler_picture_ctrl & 0x60 )
-    {
-    case 0x20 : update_byte = update_byte_bigmem_multi;    break;
-    case 0x60 : update_byte = update_byte_bigmem_single;   break;
-    case 0x00 : update_byte = update_byte_smallmem_multi;  break;
-    case 0x40 : update_byte = update_byte_smallmem_single; break;
-    }
-}
-
-
-void dazzler_receive(uint8_t data)
-{
-  static int state = ST_IDLE, addr, cnt;
-
-  switch( state )
-    {
-    case ST_IDLE:
-      {
-        switch( data & 0xf0 )
-          {
-          case DAZ_MEMBYTE: 
-            state = ST_MEMBYTE1;
-            addr  = (data & 0x07) * 256;
-            break;
-
-          case DAZ_CTRL:
-            state = ST_CTRL;
-            break;
-
-          case DAZ_CTRLPIC:
-            state = ST_CTRLPIC;
-            break;
-
-          case DAZ_FULLFRAME:
-            state = ST_FULLFRAME;
-            addr  = 0;
-            cnt   = (data & 0x0f) ? 2048 : 512;
-            break;
-          }
-        break;
-      }
-      
-    case ST_MEMBYTE1:
-      addr += data;
-      state = ST_MEMBYTE2;
-      break;
-
-    case ST_MEMBYTE2:
-      if( data != dazzler_mem[addr] ) { update_byte(addr, data); dazzler_mem[addr] = data; }
-      state = ST_IDLE;
-      break;
-
-    case ST_CTRL:
-      dazzler_ctrl = data;
-#if ALWAYS_ON==0
-      // start/stop generating the output signal
-      g_current_line = 0;
-      if( dazzler_ctrl & 0x80 )
-        PLIB_TMR_Start(TMR_ID_2);
-      else
-        PLIB_TMR_Stop(TMR_ID_2);
-#endif      
-      state = ST_IDLE;
-      break;
-
-    case ST_CTRLPIC:
-      if( data != dazzler_picture_ctrl )
-        {
-          if( data != dazzler_picture_ctrl )
-            {
-              uint8_t ctrl = dazzler_picture_ctrl;
-              dazzler_picture_ctrl = data;
-              set_update_byte();
-
-              if( (data & 0x20)!=(ctrl & 0x20) )
-                {
-                  // redraw the full frame if memory size setting has changed
-                  int i, w = (dazzler_picture_ctrl & 0x20) ? 2048 : 512;
-                  for(i=0; i<w; i++) update_byte(i, dazzler_mem[i]);
-                }
-              else if( (data & 0x40)!=(ctrl & 0x40) || ((ctrl & 0x40) && (data & 0x0f)!=(ctrl & 0x0f)) )
-                {
-                  // redraw only the foreground if the 1x/4x resolution setting has changed or
-                  // we are in 4x resolution mode and the (common) color has changed
-                  int i, w = (dazzler_picture_ctrl & 0x20) ? 2048 : 512;
-                  for(i=0; i<w; i++)
-                    if( dazzler_mem[i]!=0 )
-                      update_byte(i, dazzler_mem[i]);
-                }
-
-              ColorStateSet((dazzler_picture_ctrl & 0x10)!=0);
-            }
-        }
-
-      state = ST_IDLE;
-      break;
-
-    case ST_FULLFRAME:
-      if( data != dazzler_mem[addr] ) { update_byte(addr, data); dazzler_mem[addr] = data;}
-      addr++;
-      if( --cnt==0 ) state = ST_IDLE; 
-      break;
-    }
-}
-
+static void dazzler_send(uint8_t *buffer, size_t len);
 
 // -----------------------------------------------------------------------------
 // --------------------------- ring-buffer handling ----------------------------
 // -----------------------------------------------------------------------------
 
 
-uint32_t ringbuffer_start = 0, ringbuffer_end = 0;
-uint8_t  ringbuffer[0x1000];
+#define RINGBUFFER_SIZE 0x01000 // must be a power of 2
+volatile uint32_t ringbuffer_start = 0, ringbuffer_end = 0;
+uint8_t ringbuffer[RINGBUFFER_SIZE+64];
 
-#define ringbuffer_full()     (((ringbuffer_end+1)&0x0fff) == ringbuffer_start)
-#define ringbuffer_empty()      (ringbuffer_start==ringbuffer_end)
-#define ringbuffer_available() ((ringbuffer_start-ringbuffer_end-1)&0x0fff)
+#define ringbuffer_full()                (((ringbuffer_end+1)&(RINGBUFFER_SIZE-1)) == ringbuffer_start)
+#define ringbuffer_empty()                 (ringbuffer_start==ringbuffer_end)
+#define ringbuffer_available_for_read()  (((ringbuffer_end+RINGBUFFER_SIZE)-ringbuffer_start)&(RINGBUFFER_SIZE-1))
+#define ringbuffer_available_for_write() (((ringbuffer_start+RINGBUFFER_SIZE)-ringbuffer_end-1)&(RINGBUFFER_SIZE-1))
+#define ringbuffer_peek()                  (ringbuffer[ringbuffer_start])
 
 
 inline void ringbuffer_enqueue(uint8_t b)
 {
-  // There's really not much we can do if we receive a byte of data
-  // when the ring buffer is full. Overwriting the beginning of the buffer
-  // is about as bad as dropping the newly received byte. So we save
-  // the time to check whether the buffer is full and just overwrite.
   ringbuffer[ringbuffer_end] = b;
-  ringbuffer_end = (ringbuffer_end+1) & 0x0fff;
+  ringbuffer_end = (ringbuffer_end+1) & (RINGBUFFER_SIZE-1);
 }
 
 inline uint8_t ringbuffer_dequeue()
 {
-  if( !ringbuffer_empty() )
-    {
-      dazzler_receive(ringbuffer[ringbuffer_start]);
-      ringbuffer_start = (ringbuffer_start+1) & 0x0fff;
-    }
+  uint8_t data = ringbuffer[ringbuffer_start];
+  ringbuffer_start = (ringbuffer_start+1) & (RINGBUFFER_SIZE-1);
+  return data;
 }
 
-
-#if USE_USB==0
-inline void ringbuffer_enqueue_usart()
+uint8_t ringbuffer_process_data()
 {
-  if( PLIB_USART_ReceiverDataIsAvailable(USART_ID_2) )
-    ringbuffer_enqueue(PLIB_USART_ReceiverByteReceive(USART_ID_2));
+  static uint32_t addr = 0, cnt = 0;
+  uint32_t available;
+  uint8_t cmd;
+
+  available = ringbuffer_available_for_read();
+  cmd = ringbuffer_peek();
+
+  if( cnt==0 && available>0 )
+    {
+      switch( cmd & 0xF0 )
+        {
+        case DAZ_MEMBYTE: 
+          {
+            if( available>=3 )
+              {
+                ringbuffer_dequeue();
+                addr = (cmd & 0x0F) * 256 + ringbuffer_dequeue();
+                dazzler_mem[addr] = ringbuffer_dequeue();
+              }
+            break;
+          }
+
+        case DAZ_CTRL:
+          {
+            if( (cmd&0x0F)==0 && available>=2 )
+              {
+                ringbuffer_dequeue();
+                dazzler_ctrl = ringbuffer_dequeue();
+                // a version 0 computer writes only to buffer 0 but may set bit 0
+                // (used in version 1+ as buffer-select) as either 0 or 1.
+                if( computer_version==0 ) dazzler_ctrl &= 0xFE;
+                test_mode = 0;
+#if ALWAYS_ON==0
+                // start/stop generating the output signal
+                g_current_line = 0;
+                if( dazzler_ctrl & 0x80 )
+                  PLIB_TMR_Start(TMR_ID_2);
+                else
+                  PLIB_TMR_Stop(TMR_ID_2);
+#endif      
+              }
+            break;
+          }
+            
+        case DAZ_CTRLPIC:
+          {
+            if( (cmd&0x0F)==0 && available>=2 )
+              {
+                ringbuffer_dequeue();
+                dazzler_picture_ctrl = ringbuffer_dequeue();
+              }
+            break;
+          }
+            
+        case DAZ_FULLFRAME:
+          {
+            ringbuffer_dequeue();
+            
+            // only a valid FULLFRAME command if bits 1+2 are zero
+            if( (cmd&0x06)==0 )
+              {
+                addr  = (cmd & 0x08) * 256;
+                cnt   = (cmd & 0x01) ? 2048 : 512;
+                if( available>0 ) available--;
+              }
+            break;
+          }
+
+        case DAZ_VERSION:
+          {
+            ringbuffer_dequeue();
+            computer_version = cmd & 0x0F;
+
+            // respond by sending our version to the computer
+            static uint8_t cmd = DAZ_VERSION | (DAZZLER_VERSION&0x0F);
+            dazzler_send(&cmd, 1);
+            break;
+          }
+        
+        default:
+          {
+            // remove the unrecognized command from the ringbuffer, otherwise
+            // we would just block forever. Given that we ignore unrecognized
+            // commands, there is a chance we'll get back into sync.
+            ringbuffer_dequeue();
+            break;
+        }
+      }
+  }
+
+  if( cnt>0 && available>0 )
+    {
+      // receiving fullframe data
+      uint32_t n = ringbuffer_start<=ringbuffer_end ? ringbuffer_end-ringbuffer_start : RINGBUFFER_SIZE-ringbuffer_start;
+      n = min(n, cnt);
+      memcpy(dazzler_mem+addr, ringbuffer+ringbuffer_start, n);
+      addr += n;
+      cnt  -= n;
+      ringbuffer_start = (ringbuffer_start+n) & (RINGBUFFER_SIZE-1);
+   }
 }
-#endif
 
 
 // -----------------------------------------------------------------------------
@@ -471,25 +307,58 @@ inline void ringbuffer_enqueue_usart()
 // -----------------------------------------------------------------------------
 
 
+int get_pixel_128x128(int x, int y)
+{
+  uint32_t addr;
+  static uint8_t bitmasks[8] = {0x01, 0x02, 0x10, 0x20, 0x04, 0x08, 0x40, 0x80};
+
+  x &= 127;
+  y &= 127;
+  addr = (y&62)*8 + ((x&63)/4);
+  if( x>=64 ) addr += 512;
+  if( y>=64 ) addr += 1024;
+
+  return (dazzler_mem[addr] & (bitmasks[(x&3) + 4*(y&1)])) ? 1 : 0;
+}
+
+
+void set_pixel_128x128(int x, int y, int on)
+{
+  uint32_t addr;
+  static uint8_t bitmasks[8] = {0x01, 0x02, 0x10, 0x20, 0x04, 0x08, 0x40, 0x80};
+
+  x &= 127;
+  y &= 127;
+  addr = (y&62)*8 + ((x&63)/4);
+  if( x>=64 ) addr += 512;
+  if( y>=64 ) addr += 1024;
+
+  if( on )
+    dazzler_mem[addr] |=  (bitmasks[(x&3) + 4*(y&1)]);
+  else 
+    dazzler_mem[addr] &= ~(bitmasks[(x&3) + 4*(y&1)]);
+}
+
+
 void draw_joystick_pixel(int x, int y)
 {
   static int px, py, pc = -1;
   x = x/2+64;
   y = 63-y/2;
-  if( pc>=0 ) framebuffer[py][px] = pc;
-  pc = framebuffer[y][x];
+  if( pc>=0 ) set_pixel_128x128(px, py, pc);
+  pc = get_pixel_128x128(x, y);
   px = x;
   py = y;
-  framebuffer[y][x] = 0x0f;
+  set_pixel_128x128(x, y, 1);
 }
 
 
 void draw_joystick_buttons(uint8_t buttons)
 {
-  framebuffer[0][61] = (buttons & 0x01) ? 0x04 : 0x02;
-  framebuffer[0][63] = (buttons & 0x02) ? 0x04 : 0x02;
-  framebuffer[0][65] = (buttons & 0x04) ? 0x04 : 0x02;
-  framebuffer[0][67] = (buttons & 0x08) ? 0x04 : 0x02;
+  set_pixel_128x128(61, 0, buttons & 0x01);
+  set_pixel_128x128(63, 0, buttons & 0x02);
+  set_pixel_128x128(65, 0, buttons & 0x04);
+  set_pixel_128x128(67, 0, buttons & 0x08);
 }
 
 
@@ -501,42 +370,57 @@ void draw_test_screen()
     case 1:
     case 2:
       // joystick test screen
+      dazzler_picture_ctrl = 0x79;
       for(r=0; r<128; r++)
         {
-          framebuffer[r][0]   = 0x01;
-          framebuffer[r][64]  = (r & 1) && r<127 ? 0x01 : 0x00;
-          framebuffer[r][127] = 0x01;
+          set_pixel_128x128(  0, r, 0x01);
+          set_pixel_128x128( 64, r, (r & 1) && r<127 ? 0x01 : 0x00);
+          set_pixel_128x128(127, r, 0x01);
         }
       for(c=0; c<128; c++)
         {
-          framebuffer[0][c]   = 0x01;
-          framebuffer[63][c]  = (c & 1) && c<127 ? 0x00 : 0x01;
-          framebuffer[127][c] = 0x01;
+          set_pixel_128x128(c,   0, 0x01);
+          set_pixel_128x128(c,  63, (c & 1) && c<127 ? 0x00 : 0x01);
+          set_pixel_128x128(c, 127, 0x01);
         }
       break;
                         
     case 11:
-      // color test pattern
-      ColorOn();
+      // color test pattern (normal res, small mem)
+      dazzler_picture_ctrl = 0x10;
       for(r=0; r<32; r++)
         for(c=0; c<16; c++)
-          update_byte_smallmem_multi(r*16+c, ((r+c)&7) + 16*(((r+c)&7)+8));
+          dazzler_mem[r*16+c] = ((r+c)&7) + 16*(((r+c)&7)+8);
       break;
                         
     case 12:
-      // gray-scale test pattern
-      ColorOff();
+      // color test pattern (normal res, big mem)
+      dazzler_picture_ctrl = 0x30;
       for(r=0; r<32; r++)
         for(c=0; c<16; c++)
-          update_byte_smallmem_multi(r*16+c, ((r+c*2)&15) + 16*((r+c*2+1)&15));
+          dazzler_mem[r*16+c] = ((r+c)&7) + 16*(((r+c)&7)+8);
+      memcpy(dazzler_mem+512, dazzler_mem, 512);
+      memcpy(dazzler_mem+1024, dazzler_mem, 1024);
       break;
-                      
+
     case 13:
-      // black-and-white grid pattern
-      ColorOff();
-      for(r=0; r<128; r++)
-        for(c=0; c<128; c++)
-          framebuffer[r][c] = r&1 ? 0xff : ((c&1) ? 0x00 : 0xff);
+      // black-and-white grid pattern (4x res, small mem)
+      dazzler_picture_ctrl = 0x4F; 
+      for(r=0; r<512; r++) dazzler_mem[r] = 0xEE;
+      break;
+                        
+    case 14:
+      // black-and-white grid pattern (4x res, big mem)
+      dazzler_picture_ctrl = 0x6F; 
+      for(r=0; r<2048; r++) dazzler_mem[r] = 0xEE;
+      break;
+                        
+    case 15:
+      // gray-scale test pattern (normal res, small mem)
+      dazzler_picture_ctrl = 0x00;
+      for(r=0; r<32; r++)
+        for(c=0; c<16; c++)
+          dazzler_mem[r*16+c] = ((r+c*2)&15) + 16*((r+c*2+1)&15);
       break;
     }
 }
@@ -555,7 +439,7 @@ void check_test_button()
     {
       // button still pressed after one frame => valid button press (not a bounce))
       test_mode = test_mode+1;
-      if( test_mode>13 ) test_mode = 11;
+      if( test_mode>15 ) test_mode = 11;
       draw_test_screen();
       debounce = 2;
     }
@@ -570,11 +454,6 @@ void check_test_button()
 // -----------------------------------------------------------------------------
 // ----------------------------- joystick handling -----------------------------
 // -----------------------------------------------------------------------------
-
-#if USE_USB>0
-volatile uint64_t usb_joydata = 0;
-#endif
-
 
 #define AVGC 4
 int rolling_average(int n, int v)
@@ -732,25 +611,20 @@ void check_joystick()
               
         case 6: 
           {
-#if USE_USB>0
-            // copy joystick 1 data to USB send buffer
-            uint8_t *jd = (uint8_t *) &usb_joydata;
-            jd[0] = DAZ_JOY1 | b1;
-            jd[1] = x1;
-            jd[2] = y1;
-#else
             // check if there are any any changes for joystick 1
             if( x1!=x1p || y1!=y1p || b1 != b1p )
               {
-                // send joystick 1 data over serial
-                PLIB_USART_TransmitterByteSend(USART_ID_2, DAZ_JOY1 | b1);
-                PLIB_USART_TransmitterByteSend(USART_ID_2, x1);
-                PLIB_USART_TransmitterByteSend(USART_ID_2, y1);
-             
+                // send joystick 2 data
+                static uint8_t buf[3];
+                buf[0] = DAZ_JOY1 | b1;
+                buf[1] = x1;
+                buf[2] = y1;
+                dazzler_send(buf, 3);
+
                 // remember current values
                 x1p = x1; y1p = y1; b1p = b1;
               }
-#endif
+
             // draw calibration info if in calibration mode
             if( test_mode==1 ) 
               {
@@ -764,25 +638,19 @@ void check_joystick()
           
         case 7:
           {
-#if USE_USB>0
-            // copy joystick 2 data to USB send buffer
-            uint8_t *jd = (uint8_t *) &usb_joydata;
-            jd[3] = DAZ_JOY2 | b2;
-            jd[4] = x2;
-            jd[5] = y2;
-#else          
             // check if there are any any changes for joystick 2
             if( x2!=x2p || y2!=y2p || b2 != b2p )
               {
-                // send joystick 2 data over serial
-                PLIB_USART_TransmitterByteSend(USART_ID_2, DAZ_JOY2 | b2);
-                PLIB_USART_TransmitterByteSend(USART_ID_2, x2);
-                PLIB_USART_TransmitterByteSend(USART_ID_2, y2);
+                // send joystick 2 data
+                static uint8_t buf[3];
+                buf[0] = DAZ_JOY2 | b2;
+                buf[1] = x2;
+                buf[2] = y2;
+                dazzler_send(buf, 3);
 
                 // remember current values
                 x2p = x2; y2p = y2; b2p = b2;
               }
-#endif
 
             // draw calibration info if in calibration mode
             if( test_mode==2 ) 
@@ -795,6 +663,133 @@ void check_joystick()
             break;
           }
         }
+    }
+}
+
+
+// -----------------------------------------------------------------------------
+// -------------------------   video line rendering   --------------------------
+// -----------------------------------------------------------------------------
+
+// Line buffer has 2 sets of 2 lines of 128+1 columns (one extra 0 at the end)
+// (use 132 bytes per line to stay 32-bit aligned)
+// We render two lines at once because of the Dazzler's video memory layout
+// where (in x4 resolution mode) one byte contains information for two lines.
+// We have two sets of two lines so we can actually display one set while
+// rendering the other
+#define LL (128+4)
+uint8_t linebuffer[4*LL] __attribute__((aligned(32)));
+
+// Each s scan line needs to be repeated 2^repeat_line times
+// (this depends on the graphics mode)
+uint8_t repeat_line = 0;
+
+// common foreground color to use for the current frame
+uint8_t dazzler_fg_color = 0x00;
+
+// line rendering function to use for the current frame
+void render_line_dummy(int buffer, int line, int part) {}
+void (*render_line)(int, int, int) = &render_line_dummy;
+
+void render_line_bigmem_single(int buffer, int line, int part)
+{
+  // 2K RAM, high (x4) resolution (128x128 pixels, single foreground color)
+  // rendering 2 lines at a time
+  uint8_t i, color = dazzler_fg_color;
+  uint8_t *lp = linebuffer + (buffer==0 ? 0 : (2*LL)) + part * 16;
+  uint8_t *mp = dazzler_mem_buf + (line&62)*8 + (line&64)*16 + (part&3)*4 + (part&4)*128;
+
+  for(i=0; i<4; i++)
+    {
+      uint8_t b = mp[i];
+      lp[0   ] = b & 0x01 ? color : 0;
+      lp[1   ] = b & 0x02 ? color : 0;
+      lp[2   ] = b & 0x10 ? color : 0;
+      lp[3   ] = b & 0x20 ? color : 0;
+      lp[0+LL] = b & 0x04 ? color : 0;
+      lp[1+LL] = b & 0x08 ? color : 0;
+      lp[2+LL] = b & 0x40 ? color : 0;
+      lp[3+LL] = b & 0x80 ? color : 0;
+      lp += 4;
+    }
+}
+
+
+void render_line_bigmem_multi(int buffer, int line, int part)
+{
+  // 2K RAM, low resolution (64x64 pixels, individual color)
+  uint8_t i, color1, color2; 
+  uint8_t *lp = linebuffer + (buffer==0 ? 0 : (2*LL)) + part * 16;
+  uint8_t *mp = dazzler_mem_buf + (line&62)*8 + (line&64)*16 + (part&3)*4 + (part&4)*128;
+
+  for(i=0; i<4; i++)
+    {
+      uint8_t b = mp[i];
+      color1 = b & 0x0f;
+      color2 = (b & 0xf0)/16;
+
+      lp[0   ] = lp[1   ] = color1;
+      lp[2   ] = lp[3   ] = color2;
+      lp[0+LL] = lp[1+LL] = color1;
+      lp[2+LL] = lp[3+LL] = color2;
+      lp += 4;
+    }
+}
+
+
+void render_line_smallmem_single(int buffer, int line, int part)
+{
+  // 512 bytes RAM, high resolution (64x64 pixels, common color)
+  uint8_t i, color = dazzler_fg_color;
+  uint8_t *lp = linebuffer + (buffer==0 ? 0 : (2*LL)) + part * 16;
+  uint8_t *mp = dazzler_mem_buf + (line & 124) * 4 + part * 2;
+
+  for(i=0; i<2; i++)
+    {
+      uint8_t b = mp[i];
+      lp[0]    = lp[1]    = b & 0x01 ? color : 0;
+      lp[2]    = lp[3]    = b & 0x02 ? color : 0;
+      lp[4]    = lp[5]    = b & 0x10 ? color : 0;
+      lp[6]    = lp[7]    = b & 0x20 ? color : 0;
+      lp[0+LL] = lp[1+LL] = b & 0x04 ? color : 0;
+      lp[2+LL] = lp[3+LL] = b & 0x08 ? color : 0;
+      lp[4+LL] = lp[5+LL] = b & 0x40 ? color : 0;
+      lp[6+LL] = lp[7+LL] = b & 0x80 ? color : 0;
+      lp += 8;
+    }
+}
+
+
+void render_line_smallmem_multi(int buffer, int line, int part)
+{
+  // 512 bytes RAM, low resolution (32x32 pixels, individual color)
+  uint8_t color1, color2, i;
+  uint8_t *lp = linebuffer + (buffer==0 ? 0 : (2*LL)) + part * 16;
+  uint8_t *mp = dazzler_mem_buf + (line & 124) * 4 + part * 2;
+
+  for(i=0; i<2; i++)
+    {
+      uint8_t b = mp[i];
+      color1 = b & 0x0f;
+      color2 = (b & 0xf0)/16;
+
+      lp[0] = lp[1] = lp[2] = lp[3] = color1;
+      lp[4] = lp[5] = lp[6] = lp[7] = color2;
+      lp[0+LL] = lp[1+LL] = lp[2+LL] = lp[3+LL] = color1;
+      lp[4+LL] = lp[5+LL] = lp[6+LL] = lp[7+LL] = color2;
+      lp += 8;
+    }
+}
+
+
+void set_render_line()
+{
+  switch( dazzler_picture_ctrl & 0x60 )
+    {
+    case 0x20 : render_line = render_line_bigmem_multi;    repeat_line = 2; /* =*4 */ break;
+    case 0x60 : render_line = render_line_bigmem_single;   repeat_line = 2; /* =*4 */ break;
+    case 0x00 : render_line = render_line_smallmem_multi;  repeat_line = 3; /* =*8 */ break;
+    case 0x40 : render_line = render_line_smallmem_single; repeat_line = 3; /* =*8 */ break;
     }
 }
 
@@ -813,8 +808,14 @@ void __ISR(_TIMER_2_VECTOR, ipl7AUTO) IntHandlerTimer2(void)
 
   if( g_current_line>=VBP_LENGTH && g_current_line<(VBP_LENGTH+DISPLAY_LINES) )
     {
-      // we are in the vertically visible region
-      uint8_t *ptr = framebuffer[(g_current_line-VBP_LENGTH)/4];
+      // we are in the vertically visible region. Show line
+      // line  0,  1,  2,  3 => linebuffer[0]
+      // line  4,  5,  6,  7 => linebuffer[1]
+      // line  8,  9, 10, 11 => linebuffer[2]
+      // line 12, 13, 14, 15 => linebuffer[3]
+      // line 16, 17, 18, 19 => linebuffer[0]
+      // ...
+      uint8_t *ptr = linebuffer + (((g_current_line-VBP_LENGTH)>>repeat_line)&3) * LL;
       uint8_t *end = ptr + 129;
 
       if( dazzler_ctrl & 0x80 )
@@ -855,18 +856,72 @@ void __ISR(_TIMER_2_VECTOR, ipl7AUTO) IntHandlerTimer2(void)
       PLIB_OC_ModeSelect(OC_ID_3, OC_SET_LOW_SINGLE_PULSE_MODE);
       PLIB_OC_Enable(OC_ID_3);
     }
-
-#if USE_USB==0
-  // The line rate is 37300Hz, i.e. each line takes 0.027 milliseconds.
-  // At 750000 baud, each character (10 bits) takes 0.013 milliseconds
-  // => no more than 3 characters can be received per line
-  ringbuffer_enqueue_usart(); 
-  ringbuffer_enqueue_usart(); 
-  ringbuffer_enqueue_usart();
-#endif
-    
+  
+  if( g_current_line>=VBP_LENGTH-8 && g_current_line<VBP_LENGTH+DISPLAY_LINES-8 )
+    {
+      // we are in (or just before) the vertically visible region. 
+      // Render part of next line to be shown
+      // scan line   0 => render part 0 of line 0 into linebuffer 0 and 1
+      // scan line   1 => render part 1 of line 0 into linebuffer 0 and 1
+      // ...
+      // scan line   7 => render part 7 of line 0 into linebuffer 0 and 1
+      // scan line   8 => render part 0 of line 1 into linebuffer 2 and 3
+      // scan line   9 => render part 1 of line 1 into linebuffer 2 and 3
+      // ...
+      // scan line  15 => render part 7 of line 1 into linebuffer 2 and 3
+      // scan line  16 => render part 0 of line 2 into linebuffer 0 and 1
+      // ...
+      uint32_t line = g_current_line - VBP_LENGTH + 8;
+      render_line((line>>(repeat_line+1))&1, line/4, line&7);
+#if SHOW_RINGBUFFER>0
+      if( line==7 )
+        {
+          byte c1 = ColorStateGet() ? 0x0A : 0x07;
+          byte c2 = ColorStateGet() ? 0x09 : 0x00;
+          int s = ringbuffer_start * 128 / RINGBUFFER_SIZE;
+          int e = ringbuffer_end   * 128 / RINGBUFFER_SIZE;
+          if( s==e )
+            memset(linebuffer, c1, 128);
+          else if( s<e )
+          {
+            memset(linebuffer,   c1, s);
+            memset(linebuffer+s, c2, e-s);
+            memset(linebuffer+e, c1, 128-e);
+          }
+          else
+          {
+            memset(linebuffer,   c2, e);
+            memset(linebuffer+e, c1, s-e);
+            memset(linebuffer+s, c2, 128-s);
+          }
+          linebuffer[s] = c2;
+        }
+#endif      
+    }
+  else if( g_current_line==NUM_LINES-3)
+    memcpy(dazzler_mem_buf, dazzler_mem + (dazzler_ctrl & 1) * 2048, 1024);
+  else if( g_current_line==NUM_LINES-2)
+    memcpy(dazzler_mem_buf + 1024, dazzler_mem + (dazzler_ctrl & 1) * 2048 + 1024, 1024);
+  
   // increase line counter and roll over when we reach the bottom of the screen
-  if( ++g_current_line==NUM_LINES ) g_current_line=0;
+  if( ++g_current_line==NUM_LINES ) 
+    { 
+      g_current_line=0; 
+      g_frame_ctr++; 
+
+      // signal to send VSYNC command to computer (if computer understands it)
+      // (can't send directly from here since it can cause lock-ups in USB)
+      if( computer_version>0 ) send_vsync = true;
+      
+      // set the color/grayscale bit for the next frame
+      ColorStateSet((dazzler_picture_ctrl & 0x10)!=0);
+
+      // set the render_line function for the next frame
+      set_render_line();
+
+      // set the common foreground color for next frame
+      dazzler_fg_color = dazzler_picture_ctrl & 0x0F;
+ }
 
   // allow next interrupt
   PLIB_INT_SourceFlagClear(INT_ID_0,INT_SOURCE_TIMER_2);
@@ -902,85 +957,69 @@ void __ISR(_OUTPUT_COMPARE_2_VECTOR, ipl6AUTO) IntHandlerOC2(void)
 
 #if USE_USB>0
 
+// technically more than 8 64-byte packets can fit into a 1ms frame but
+// the video interrupt occupies a significant amount of time so USB
+// handling can get delayed processing the received packets. We only
+// request 8 64-byte data packets to leave some safety margin.
+#define USB_MAX_TRANSFER_SIZE (8*64) // must be a multiple of 64
+
 static USB_HOST_CDC_OBJ    usbCdcObject     = NULL;
 static USB_HOST_CDC_HANDLE usbCdcHostHandle = USB_HOST_CDC_HANDLE_INVALID;
-static uint8_t usbInData[64];
 volatile bool usbBusy = false;
+uint8_t usbbuffer[USB_MAX_TRANSFER_SIZE];
 
 
-void usbScheduleTransfer()
+void usbScheduleRead()
 {
-  static uint64_t joydata_prev = 0;
-
-  if( usbBusy )
-    {
-      // a USB read or write request is currently in process so we can't
-      // schedule a transfer right now
-      return;
-    }
-  else if( usb_joydata!=joydata_prev )
-    {
-      // note that the joystick data is only updated once per frame
-      // so at 60fps it can not change fast enough to starve out the reads
-      joydata_prev = usb_joydata;
-      USB_HOST_CDC_Write(usbCdcHostHandle, NULL, (void *) &joydata_prev, 6);
-      usbBusy = true;
-    }
-  else
+  // if a USB read or write request is currently in process then we can't
+  // schedule a transfer right now
+  if( !usbBusy )
     {
       // If there is space available in the ringbuffer then ask the client
       // to send more data. If there is no space then do not start another
-      // request until we have processed some data and space is available.
-      size_t avail = ringbuffer_available();
+      // request until we have processed some data and enough space is available
+      // to store at least one full 64-byte packet of USB traffic
+      size_t avail = ringbuffer_available_for_write() & ~0x3F;
       if( avail>0 ) 
         {
-          USB_HOST_CDC_Read(usbCdcHostHandle, NULL, usbInData, avail > 64 ? 64 : avail);
+          USB_HOST_CDC_Read(usbCdcHostHandle, NULL, usbbuffer, min(avail, USB_MAX_TRANSFER_SIZE));
           usbBusy = true;
         }
     }
 }
 
 
-void USBHostCDCAttachEventListener(USB_HOST_CDC_OBJ cdcObj, uintptr_t context)
-{
-  // a client has been attached
-  usbCdcObject = cdcObj;
-}
-
-
 USB_HOST_CDC_EVENT_RESPONSE USBHostCDCEventHandler(USB_HOST_CDC_HANDLE cdcHandle, USB_HOST_CDC_EVENT event, void * eventData, uintptr_t context)
 {
-  USB_HOST_CDC_EVENT_WRITE_COMPLETE_DATA * writeCompleteEventData;
-  USB_HOST_CDC_EVENT_READ_COMPLETE_DATA * readCompleteEventData;
-    
   switch(event)
     {
     case USB_HOST_CDC_EVENT_READ_COMPLETE:
       {
-        readCompleteEventData = (USB_HOST_CDC_EVENT_READ_COMPLETE_DATA *)(eventData);
+        USB_HOST_CDC_EVENT_READ_COMPLETE_DATA *readCompleteEventData = (USB_HOST_CDC_EVENT_READ_COMPLETE_DATA *)(eventData);
         if( readCompleteEventData->result == USB_HOST_CDC_RESULT_SUCCESS )
           {
-            // received data from the client => put it in the ringbuffer so it can
-            // be processed when we get to it
-            size_t i;
-            for(i=0; i<readCompleteEventData->length; i++)
-              ringbuffer_enqueue(usbInData[i]);
-          }
+            size_t len = readCompleteEventData->length;
+            if( ringbuffer_end+len < RINGBUFFER_SIZE )
+              {
+                memcpy(ringbuffer+ringbuffer_end, usbbuffer, len);
+                ringbuffer_end += len;
+              }
+            else
+              {
+                size_t len2 = RINGBUFFER_SIZE-ringbuffer_end;
+                memcpy(ringbuffer+ringbuffer_end, usbbuffer, len2);
+                memcpy(ringbuffer, usbbuffer+len2, len-len2);
+                ringbuffer_end = len-len2;
+              }
 
-        // transfer is finished => schedule the next transfer
-        usbBusy = false;
-        usbScheduleTransfer();
+           // schedule another read
+           usbBusy = false;
+           usbScheduleRead();
+        }
+
         break;
       }
         
-    case USB_HOST_CDC_EVENT_WRITE_COMPLETE:
-      {   
-        // transfer is finished => schedule the next transfer
-        usbBusy = false;
-        usbScheduleTransfer();
-        break;
-      }
-            
     case USB_HOST_CDC_EVENT_DEVICE_DETACHED:
       {
         // USB_HOST_CDC_Close(usbCdcHostHandle);
@@ -989,8 +1028,15 @@ USB_HOST_CDC_EVENT_RESPONSE USBHostCDCEventHandler(USB_HOST_CDC_HANDLE cdcHandle
         break;
       }
     }
-    
+
   return(USB_HOST_CDC_EVENT_RESPONE_NONE);
+}
+
+
+void USBHostCDCAttachEventListener(USB_HOST_CDC_OBJ cdcObj, uintptr_t context)
+{
+  // a client has been attached
+  usbCdcObject = cdcObj;
 }
 
 
@@ -1006,22 +1052,37 @@ void usbTasks()
             {
               // succeeded opening the device => all further processing is in event handler
               USB_HOST_CDC_EventHandlerSet(usbCdcHostHandle, USBHostCDCEventHandler, (uintptr_t)0);
-          
-              // request data
-              USB_HOST_CDC_Read(usbCdcHostHandle, NULL, usbInData, 64);
+
+              // initialize ringbuffer
+              ringbuffer_start = ringbuffer_end = 0;
+              computer_version = 0;
+              usbBusy = false;
             }
         }
     }
   else
     {
-      // we have a connection => schedule a new transfer if none is currently going
+      // we have a connection => schedule a new read if none is currently going
       // (can't allow USB interrupts while scheduling a new transfer)
-      asm volatile ("di");
-      usbScheduleTransfer();
-      asm volatile ("ei");
+      PLIB_USB_InterruptDisable(USB_ID_1, USB_INT_TOKEN_DONE);
+      usbScheduleRead();
+      PLIB_USB_InterruptEnable(USB_ID_1, USB_INT_TOKEN_DONE);
     }
 }
 #endif
+
+
+static void dazzler_send(uint8_t *buffer, size_t len)
+{
+#if USE_USB>0
+  if( usbCdcHostHandle!=USB_HOST_CDC_HANDLE_INVALID )
+    USB_HOST_CDC_Write(usbCdcHostHandle, NULL, (void *) buffer, len);
+#else
+  size_t i;
+  for(i=0; i<len; i++) PLIB_USART_TransmitterByteSend(USART_ID_2, buffer[i]);
+#endif
+}
+
 
 // -----------------------------------------------------------------------------
 // ------------------------------- initialization ------------------------------
@@ -1076,9 +1137,6 @@ void APP_Initialize ( void )
   PLIB_OC_TimerSelect(OC_ID_3, OC_TIMER_16BIT_TMR2);
   PLIB_OC_Buffer16BitSet(OC_ID_3, 0);
 
-  // initialize update_byte function
-  set_update_byte();
- 
   // set up ADC for joystick input
   PLIB_ADC_ConversionTriggerSourceSelect(ADC_ID_1, ADC_CONVERSION_TRIGGER_INTERNAL_COUNT);
   PLIB_ADC_InputScanMaskRemove(ADC_ID_1, ADC_INPUT_SCAN_AN10);
@@ -1110,13 +1168,10 @@ void APP_Initialize ( void )
   PLIB_USB_StopInIdleDisable(USB_ID_1);
   USB_HOST_BusEnable(0);
 #endif
-    
-  // set color/gray scale output pin
-  ColorStateSet((dazzler_picture_ctrl & 0x10)!=0);
-    
-  // clear frame buffer
-  memset(framebuffer, 0, sizeof(framebuffer));
 
+  // clear line rendering buffer
+  memset(linebuffer, 0, sizeof(linebuffer));
+    
   // determine whether to enter joystick calibration (test) mode
   test_mode = read_joystick_buttons();
   if( (test_mode & 0x0f)!=0x0f )
@@ -1124,8 +1179,8 @@ void APP_Initialize ( void )
   else if( (test_mode & 0xf0)!=0xf0 )
     test_mode = 2;
   else if( !TestButtonStateGet() )
-    test_mode = 13;
-  else
+    test_mode = 15;
+  else 
     test_mode = 0;
 
   // if we're in test mode, draw the test screen
@@ -1143,22 +1198,34 @@ void APP_Initialize ( void )
 
 void APP_Tasks ( void )
 {
-  // Displaying the picture and receiving data is done in interrupts
-  // so all we do in the main loop is querying the joysticks (once per frame)
-  // and processing received data
+  // query joystick (in first 7 lines of the vertical back porch)
   check_joystick();
 
   // process received data    
-  ringbuffer_dequeue();
-  ringbuffer_dequeue();
-  ringbuffer_dequeue();
+  ringbuffer_process_data();
 
 #if USE_USB>0
   // handle USB tasks
   usbTasks();
-  if( test_mode==11 ) framebuffer[0][0] = (usbCdcObject==NULL) ? 9 : 10;
+  if( test_mode==11 ) dazzler_mem[0] = ((usbCdcObject==NULL) ? 9 : 10) + (dazzler_mem[0] & 0xF0);
+#else
+  // receive serial data
+  // There's really not much we can do if we receive a byte of data
+  // when the ring buffer is full. Overwriting the beginning of the buffer
+  // is about as bad as dropping the newly received byte. So we save
+  // the time to check whether the buffer is full and just overwrite.
+  while( PLIB_USART_ReceiverDataIsAvailable(USART_ID_2) ) 
+    ringbuffer_enqueue(PLIB_USART_ReceiverByteReceive(USART_ID_2));
 #endif
 
+  // check if we need to send VSYNC to the host
+  if( send_vsync )
+  {
+     static uint8_t vsync = DAZ_VSYNC;
+     dazzler_send(&vsync, 1);
+     send_vsync = false;
+  }
+  
   // handle test mode switching
-  if( test_mode>10 ) check_test_button();
+  check_test_button();
 }

@@ -1710,14 +1710,7 @@ bool _DRV_USBFS_HOST_NonControlIRPProcess
 
                         /* For non - control transfer we don't implement a 
                          * NAK time out.Do not do anything here */
-                        if( ++pipe->nakCounter>=10 )
-                        {
-                          pipe->nakCounter = 0;
-                          pIRP->status = USB_HOST_IRP_STATUS_COMPLETED_SHORT;
-                          endIRP = true;
-                        }
-                        else
-                          endIRP = false;
+                        endIRP = false;
                         break;
 
                     default:
