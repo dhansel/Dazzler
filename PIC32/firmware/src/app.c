@@ -175,7 +175,7 @@ static void dazzler_send(uint8_t *buffer, size_t len);
 
 #define RINGBUFFER_SIZE 0x01000 // must be a power of 2
 volatile uint32_t ringbuffer_start = 0, ringbuffer_end = 0;
-uint8_t ringbuffer[RINGBUFFER_SIZE+64];
+uint8_t ringbuffer[RINGBUFFER_SIZE];
 
 #define ringbuffer_full()                (((ringbuffer_end+1)&(RINGBUFFER_SIZE-1)) == ringbuffer_start)
 #define ringbuffer_empty()                 (ringbuffer_start==ringbuffer_end)
@@ -1011,12 +1011,11 @@ USB_HOST_CDC_EVENT_RESPONSE USBHostCDCEventHandler(USB_HOST_CDC_HANDLE cdcHandle
                 memcpy(ringbuffer, usbbuffer+len2, len-len2);
                 ringbuffer_end = len-len2;
               }
+          }
 
-           // schedule another read
-           usbBusy = false;
-           usbScheduleRead();
-        }
-
+        // schedule another read
+        usbBusy = false;
+        usbScheduleRead();
         break;
       }
         
