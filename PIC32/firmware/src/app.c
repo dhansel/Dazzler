@@ -223,7 +223,12 @@ uint8_t ringbuffer_process_data()
 
         case DAZ_CTRL:
           {
-            if( (cmd&0x0F)==0 && available>=2 )
+            if( (cmd&0x0F)!=0 )
+              {
+                // illegal command
+                ringbuffer_dequeue();
+              }
+            else if(  available>=2 )
               {
                 ringbuffer_dequeue();
                 dazzler_ctrl = ringbuffer_dequeue();
@@ -245,7 +250,12 @@ uint8_t ringbuffer_process_data()
             
         case DAZ_CTRLPIC:
           {
-            if( (cmd&0x0F)==0 && available>=2 )
+            if( (cmd&0x0F)!=0 )
+              {
+                // illegal command
+                ringbuffer_dequeue();
+              }
+            else if( available>=2 )
               {
                 ringbuffer_dequeue();
                 dazzler_picture_ctrl = ringbuffer_dequeue();
@@ -614,7 +624,7 @@ void check_joystick()
             // check if there are any any changes for joystick 1
             if( x1!=x1p || y1!=y1p || b1 != b1p )
               {
-                // send joystick 2 data
+                // send joystick 1 data
                 static uint8_t buf[3];
                 buf[0] = DAZ_JOY1 | b1;
                 buf[1] = x1;
@@ -876,8 +886,8 @@ void __ISR(_TIMER_2_VECTOR, ipl7AUTO) IntHandlerTimer2(void)
 #if SHOW_RINGBUFFER>0
       if( line==7 )
         {
-          byte c1 = ColorStateGet() ? 0x0A : 0x07;
-          byte c2 = ColorStateGet() ? 0x09 : 0x00;
+          uint8_t c1 = ColorStateGet() ? 0x0A : 0x07;
+          uint8_t c2 = ColorStateGet() ? 0x09 : 0x00;
           int s = ringbuffer_start * 128 / RINGBUFFER_SIZE;
           int e = ringbuffer_end   * 128 / RINGBUFFER_SIZE;
           if( s==e )
@@ -1051,6 +1061,17 @@ void usbTasks()
             {
               // succeeded opening the device => all further processing is in event handler
               USB_HOST_CDC_EventHandlerSet(usbCdcHostHandle, USBHostCDCEventHandler, (uintptr_t)0);
+
+              // set the line coding: 115200 baud 8N1
+              // These settings will be ignored if connected to the
+              // Due's Native USB port but will be used when connected to
+              // the Programming USB port, so the port in the Simulator needs
+              // to be set accordingly. The baud rate of 115200 is the highest
+              // baud rate that the 16U2 serial-to-usb converter can sustain
+              // without introducing errors. Tested 250000 which can be exactly
+              // matched by both the SAM3X and 16U2 yet shows transmit errors.
+              static USB_CDC_LINE_CODING coding = {115200, 0, 0, 8};
+              USB_HOST_CDC_ACM_LineCodingSet(usbCdcHostHandle, NULL, &coding);
 
               // initialize ringbuffer
               ringbuffer_start = ringbuffer_end = 0;
