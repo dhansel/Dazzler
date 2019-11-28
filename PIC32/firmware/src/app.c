@@ -18,6 +18,7 @@
 // -----------------------------------------------------------------------------
 
 #include "app.h"
+#include <math.h>
 
 #include "peripheral/oc/plib_oc.h"
 #include "peripheral/tmr/plib_tmr.h"
@@ -37,6 +38,34 @@
 // If 0, do not visualize
 #define SHOW_RINGBUFFER 0
 
+// If 1, support audio output (dual 8-bit PWM), use new pins/wiring (see below)
+// If 0, do not output audio and use old pins/wiring
+// Requires different wiring of the hardware than the original setup:
+//   Element                pin without audio        pin with audio support
+//   Test button            17 (RB8)                 11 (RB4)
+//   Shift register clock   24 (RB13)                4  (RB0, shared with RGBI-R)
+//   Shift register shift   11 (RB4)                 5  (RB1, shared with RGBI-G)
+//   Audio 1 out            --                       17 (OC2)
+//   Audio 2 out            --                       24 (OC5)
+// Note that the shift register control lines are now shared with the RGBI
+// output pins (video). This does not cause a problem since the joystick buttons
+// which are handled by the shift register are only queried during the vertical
+// blank period (during which the RGBI outputs are not used).
+#define HAVE_AUDIO 1
+
+inline void ColorBlip(int n)
+{
+#if 1
+   int i, j;
+   for(j=0; j<n; j++)
+   {   
+   ColorToggle();
+   for(i=0; i<3; i++) asm volatile("nop");
+   ColorToggle();
+   for(i=0; i<3; i++) asm volatile("nop");
+   }
+#endif
+}
 
 // The following Microchip USB host stack source files have been modified from their original:
 //
@@ -85,10 +114,10 @@
 // it takes between the timer overrun and the interrupt routine actually
 // starting to push out pixels. The exact timing values were determined 
 // experimentally such that the display appears in the middle of the screen.
-#define NUM_PIXELS	   634			   // =26.417us/line (spec: 26.4us)
+#define NUM_PIXELS     634	       // =26.417us/line (spec: 26.4us)
 #define HFP_LENGTH     (24+110)        // (1us + 4.583us) front porch plus margin
 #define HBP_LENGTH     (53+50)         // (2.208us + 2.083us(+x)) back porch plus margin
-#define HSYNC_LENGTH   77			   // =3.208us  (spec: 3.2us)
+#define HSYNC_LENGTH   77	       // =3.208us  (spec: 3.2us)
 #define DISPLAY_PIXELS 320             // =13.3us (128px @ 9.7MHz=13.196us)
 #define HSYNC_START	   (NUM_PIXELS-HBP_LENGTH-HSYNC_LENGTH)
 
@@ -114,6 +143,19 @@
 #error Inconsistent vertical timing!
 #endif
 
+// adjust for different pin assignments if audio output is enabled
+#if HAVE_AUDIO>0
+#undef  ButtonsClockOff
+#define ButtonsClockOff RGBI_ROff
+#undef  ButtonsClockOn
+#define ButtonsClockOn  RGBI_ROn
+#undef  ButtonsShiftOff
+#define ButtonsShiftOff RGBI_GOff
+#undef  ButtonsShiftOn
+#define ButtonsShiftOn  RGBI_GOn
+#undef  TestButtonStateGet
+#define TestButtonStateGet() PLIB_PORTS_PinGet(PORTS_ID_0, PORT_CHANNEL_B, PORTS_BIT_POS_4)
+#endif
 
 // current scan line
 volatile uint32_t g_current_line = 0, g_frame_ctr = 0;
@@ -141,7 +183,7 @@ uint8_t dazzler_mem[2 * 2048], dazzler_mem_buf[2048];
 int test_mode = 0;
 
 // computer/dazzler version
-#define DAZZLER_VERSION 0x01
+#define DAZZLER_VERSION 0x02
 int computer_version =  0x00;
 
 // dazzler commands received from the Altair simulator
@@ -149,6 +191,7 @@ int computer_version =  0x00;
 #define DAZ_FULLFRAME 0x20
 #define DAZ_CTRL      0x30
 #define DAZ_CTRLPIC   0x40
+#define DAZ_DAC       0x50
 #define DAZ_VERSION   0xF0
 
 // dazzler commands sent to the Altair simulator
@@ -157,16 +200,49 @@ int computer_version =  0x00;
 #define DAZ_KEY       0x30
 #define DAZ_VSYNC     0x40
 
-// receiver states
-#define ST_IDLE      0
-#define ST_MEMBYTE1  1
-#define ST_MEMBYTE2  2
-#define ST_CTRL      3
-#define ST_CTRLPIC   4
-#define ST_FULLFRAME 5
+// features
+#define FEAT_VIDEO    0x01
+#define FEAT_JOYSTICK 0x02
+#define FEAT_DUAL_BUF 0x04
+#define FEAT_VSYNC    0x08
+#define FEAT_DAC      0x10
+
 
 
 static void dazzler_send(uint8_t *buffer, size_t len);
+
+
+// -----------------------------------------------------------------------------
+// --------------------------- audio-buffer handling ---------------------------
+// -----------------------------------------------------------------------------
+
+#if HAVE_AUDIO>0
+
+#define AUDIOBUFFER_SIZE 0x0400 // must be a power of 2
+
+volatile uint32_t g_audio_sample_ctr = 0;
+volatile uint32_t g_next_audio_sample[2] = {0xffffffff, 0xffffffff};
+volatile uint8_t  g_next_audio_sample_val[2] = {0, 0};
+
+volatile uint32_t audiobuffer_start[2] = {0, 0}, audiobuffer_end[2] = {0, 0};
+uint32_t audiobuffer[2][AUDIOBUFFER_SIZE];
+#define audiobuffer_empty(N) (audiobuffer_start[N]==audiobuffer_end[N])
+#define audiobuffer_available_for_write(N) (((audiobuffer_start[N]+AUDIOBUFFER_SIZE)-audiobuffer_end[N]-1)&(AUDIOBUFFER_SIZE-1))
+
+inline void audiobuffer_enqueue(int N, uint32_t b)
+{
+  audiobuffer[N][audiobuffer_end[N]] = b;
+  audiobuffer_end[N] = (audiobuffer_end[N]+1) & (AUDIOBUFFER_SIZE-1);
+}
+
+inline uint32_t audiobuffer_dequeue(int N)
+{
+  uint32_t data = audiobuffer[N][audiobuffer_start[N]];
+  audiobuffer_start[N] = (audiobuffer_start[N]+1) & (AUDIOBUFFER_SIZE-1);
+  return data;
+}
+
+#endif
 
 // -----------------------------------------------------------------------------
 // --------------------------- ring-buffer handling ----------------------------
@@ -221,6 +297,56 @@ uint8_t ringbuffer_process_data()
             break;
           }
 
+#if HAVE_AUDIO>0        
+        case DAZ_DAC:
+          {
+            if( available>=4 )
+              {
+                //ColorBlip(2);
+                static int remainder[2] = {0, 0};
+                int N = (cmd&0x0f)==0 ? 0 : 1;
+                ringbuffer_dequeue();
+                int delay_us = ringbuffer_dequeue() + ringbuffer_dequeue() * 256 + remainder[N];
+                
+                // convert delay in microseconds to delay in lines of video output
+                // by dividing by 26.417
+                // We output one audio sample for each video line, the horizontal
+                // video rate is 37854Hz or one line every 26.417 microseconds
+                // (round division result to nearest)
+                int delay_samples = (delay_us * 2000) / 26417;
+                delay_samples = (delay_samples/2) + (delay_samples&1);
+                
+                // keep the rounded-off remainder of microseconds to add to the 
+                // next sample so we can stay (mostly) in sync
+                remainder[N] = delay_us - (delay_samples*26417)/1000;
+                
+                if( delay_samples>0 )
+                {
+                  uint8_t v = 128 + ((int8_t) ringbuffer_dequeue());
+
+                  // first enqueue the sample then check whether the interrupt
+                  // routine has stopped playing, otherwise we might stall
+                  audiobuffer_enqueue(N, v + 256 * delay_samples);
+                  if( g_next_audio_sample[N]==0xffffffff ) 
+                    {
+                      // if we're not currently playing then play the first sample 
+                      // in 5ms (190*26.4us)- that gives us some time to buffer more samples
+                      uint32_t data = audiobuffer_dequeue(N);
+                      g_next_audio_sample[N] = g_audio_sample_ctr+190;
+                      g_next_audio_sample_val[N] = data & 0xff;
+                    }
+                }
+                else
+                {
+                  // delay too short => skip sample
+                  ringbuffer_dequeue();
+                }
+              }
+
+            break;
+          }
+#endif
+        
         case DAZ_CTRL:
           {
             if( (cmd&0x0F)!=0 )
@@ -283,8 +409,16 @@ uint8_t ringbuffer_process_data()
             computer_version = cmd & 0x0F;
 
             // respond by sending our version to the computer
-            static uint8_t cmd = DAZ_VERSION | (DAZZLER_VERSION&0x0F);
-            dazzler_send(&cmd, 1);
+            static uint8_t buf[3];
+            buf[0] = DAZ_VERSION | (DAZZLER_VERSION&0x0F);
+            buf[1] = FEAT_VIDEO | FEAT_JOYSTICK | FEAT_DUAL_BUF | FEAT_VSYNC;
+            buf[2] = 0;
+#if HAVE_AUDIO>0
+            buf[1] |= FEAT_DAC;
+#endif
+            
+            // only computer version 2 or later expects feature information
+            dazzler_send(buf, computer_version<2 ? 1 : 3);
             break;
           }
         
@@ -461,9 +595,59 @@ void check_test_button()
 }
 
 
+#if HAVE_AUDIO>0
+
+#define WAVSIZE 86
+static const int8_t wav_sine[WAVSIZE]     = {0,8,18,27,36,45,53,62,70,77,84,91,97,103,108,113,117,120,123,125,126,127,127,126,125,123,120,117,113,108,103,97,91,84,77,70,62,53,45,36,27,18,8,0,-9,-19,-28,-37,-46,-54,-63,-71,-78,-85,-92,-98,-104,-109,-114,-118,-121,-124,-126,-127,-128,-128,-127,-126,-124,-121,-118,-114,-109,-104,-98,-92,-85,-78,-71,-63,-54,-46,-37,-28,-19,-9};
+static const int8_t wav_sawtooth[WAVSIZE] = {0,2,5,8,11,14,17,20,23,26,29,32,35,38,41,44,47,50,53,56,59,62,64,67,70,73,76,79,82,85,88,91,94,97,100,103,106,109,112,115,118,121,124,127,-126,-123,-120,-117,-114,-111,-108,-105,-102,-99,-96,-93,-90,-87,-84,-81,-78,-75,-72,-69,-66,-64,-61,-58,-55,-52,-49,-46,-43,-40,-37,-34,-31,-28,-25,-22,-19,-16,-13,-10,-7,-4};
+static const int8_t wav_triangle[WAVSIZE] = {0,6,12,18,24,30,36,42,48,54,60,65,71,77,83,89,95,101,107,113,119,125,124,118,112,106,100,94,88,82,76,70,64,59,53,47,41,35,29,23,17,11,5,-1,-7,-13,-19,-25,-31,-37,-43,-49,-55,-61,-66,-72,-78,-84,-90,-96,-102,-108,-114,-120,-126,-123,-117,-111,-105,-99,-93,-87,-81,-75,-69,-63,-58,-52,-46,-40,-34,-28,-22,-16,-10,-4};
+static const int8_t wav_square[WAVSIZE]   = {-128,-128,-128,-128,-128,-128,-128,-128,-128,-128,-128,-128,-128,-128,-128,-128,-128,-128,-128,-128,-128,-128,-128,-128,-128,-128,-128,-128,-128,-128,-128,-128,-128,-128,-128,-128,-128,-128,-128,-128,-128,-128,-128,127,127,127,127,127,127,127,127,127,127,127,127,127,127,127,127,127,127,127,127,127,127,127,127,127,127,127,127,127,127,127,127,127,127,127,127,127,127,127,127,127,127,127};
+
+
+void test_audio(uint8_t chan, uint8_t joyb, int joyx, int joyy)
+{
+  if( (joyb&0x0F)!=0x0F )
+    {
+      int i, step, n, vol;
+      if     ( joyx <-120 ) step = 1;
+      else if( joyx < -16 ) step = 2;
+      else if( joyx <  16 ) step = 4;
+      else if( joyx < 126 ) step = 8;
+      else                  step = 16;
+      
+      n = (WAVSIZE*4)/step;
+      if( audiobuffer_available_for_write(chan)>n )
+        {
+          const int8_t *wavdata = 0;
+          if( (joyb & 0x01)==0 )
+            wavdata = wav_square;
+          else if( (joyb & 0x02)==0 )
+            wavdata = wav_sawtooth;
+          else if( (joyb & 0x04)==0 )
+            wavdata = wav_triangle;
+          else if( (joyb & 0x08)==0 )
+            wavdata = wav_sine;
+      
+          if     ( joyy <-120 ) vol =  10;
+          else if( joyy < -16 ) vol =  25;
+          else if( joyy <  16 ) vol =  50;
+          else if( joyy < 126 ) vol =  75;
+          else                  vol = 100;
+      
+          for(i=0; i<n; i++) audiobuffer_enqueue(chan, 256 + 128 + ((wavdata[(i*step)/4]*vol)/100));
+          if( g_next_audio_sample[chan]==0xffffffff ) g_next_audio_sample[chan] = g_audio_sample_ctr+2;
+        }
+    }
+}
+#endif
+
+
 // -----------------------------------------------------------------------------
 // ----------------------------- joystick handling -----------------------------
 // -----------------------------------------------------------------------------
+
+volatile int joystick_read_done = 0;
+volatile int joystick1x = 0, joystick1y  = 0, joystick2x  = 0, joystick2y  = 0, joystick1b = 0x0F, joystick2b = 0x0F;
 
 #define AVGC 4
 int rolling_average(int n, int v)
@@ -473,18 +657,18 @@ int rolling_average(int n, int v)
   int i, rv;
   
   if( ptr[n]<0 )
-  {
+    {
       for(i=0; i<AVGC; i++) buf[n][i] = v;
       sum[n]=v*AVGC;
       ptr[n]=0;
-  }
+    }
   else
-  {
+    {
       sum[n] += v - buf[n][ptr[n]];
       buf[n][ptr[n]] = v;
       ptr[n]++;
       if( ptr[n]>=AVGC ) ptr[n]=0;
-  }
+    }
   
   return sum[n]/AVGC;
 }
@@ -515,16 +699,18 @@ inline char scale_joystick_pot(int v, int center)
     return v;
 }
 
-
 uint8_t read_joystick_buttons()
 {
   int delay;
   uint8_t i, b = 0;
 
-  // turn off clock
+  // set clock line low
   ButtonsClockOff();
    
-  // produce low pulse on "shift/load"
+  // produce high-low edge on "shift/load" to load values
+  // then keep high for shifting
+  ButtonsShiftOn();
+  for(delay=0; delay<5; delay++) asm volatile("nop");
   ButtonsShiftOff();
   for(delay=0; delay<5; delay++) asm volatile("nop");
   ButtonsShiftOn();
@@ -546,134 +732,118 @@ uint8_t read_joystick_buttons()
 }
 
 
-void check_joystick()
+void read_joystick(int step)
 {
   int v;
   static int joy1_center_x = -1, joy1_center_y = -1;
   static int joy2_center_x = -1, joy2_center_y = -1;
-  static int x1  = 0, y1  = 0, x2  = 0, y2  = 0, b1  = 0, b2  = 0;
-  static int x1p = 0, y1p = 0, x2p = 0, y2p = 0, b1p = 0, b2p = 0;
-  static int m = 0;
 
-  // during the first few lines of the vertical back porch
-  // do one "joystick action" per scan line
-  if( g_current_line==m )
+  switch( step )
     {
-      switch( m )
-        {
-        case 0: 
-          // set ADC to read AN9 input (joystick 1, x axis)
-          PLIB_ADC_MuxChannel0InputPositiveSelect(ADC_ID_1, ADC_MUX_A, ADC_INPUT_POSITIVE_AN9);
-          PLIB_ADC_SamplingStart(ADC_ID_1);
-          m++;
-          break;
+    case 0: 
+      // currently reading joystick data
+      joystick_read_done = 0;
+      // set ADC to read AN9 input (joystick 1, x axis)
+      PLIB_ADC_MuxChannel0InputPositiveSelect(ADC_ID_1, ADC_MUX_A, ADC_INPUT_POSITIVE_AN9);
+      PLIB_ADC_SamplingStart(ADC_ID_1);
+      break;
 
-        case 1: 
-          // read joystick 1, x axis, initialize center on first read
-          v = rolling_average(0, PLIB_ADC_ResultGetByIndex(ADC_ID_1, 0));
-          if( joy1_center_x < 0 ) joy1_center_x = v;
-          x1 = scale_joystick_pot(v, joy1_center_x);
-          // set ADC to read AN10 input (joystick 1, y axis)
-          PLIB_ADC_MuxChannel0InputPositiveSelect(ADC_ID_1, ADC_MUX_A, ADC_INPUT_POSITIVE_AN10);
-          PLIB_ADC_SamplingStart(ADC_ID_1);
-          m++;
-          break;
+    case 1: 
+      // read joystick 1, x axis, initialize center on first read
+      v = rolling_average(0, PLIB_ADC_ResultGetByIndex(ADC_ID_1, 0));
+      if( joy1_center_x < 0 ) joy1_center_x = v;
+      joystick1x = scale_joystick_pot(v, joy1_center_x);
+      // set ADC to read AN10 input (joystick 1, y axis)
+      PLIB_ADC_MuxChannel0InputPositiveSelect(ADC_ID_1, ADC_MUX_A, ADC_INPUT_POSITIVE_AN10);
+      PLIB_ADC_SamplingStart(ADC_ID_1);
+      break;
                    
-        case 2: 
-          // read joystick 1, y axis, initialize center on first read
-          v = rolling_average(1, PLIB_ADC_ResultGetByIndex(ADC_ID_1, 0));
-          if( joy1_center_y < 0 ) joy1_center_y = v;
-          y1 = scale_joystick_pot(v, joy1_center_y);
-          // set ADC to read AN0 input (joystick 2, x axis)
-          PLIB_ADC_MuxChannel0InputPositiveSelect(ADC_ID_1, ADC_MUX_A, ADC_INPUT_POSITIVE_AN0);
-          PLIB_ADC_SamplingStart(ADC_ID_1);
-          m++;
-          break;
+    case 2: 
+      // read joystick 1, y axis, initialize center on first read
+      v = rolling_average(1, PLIB_ADC_ResultGetByIndex(ADC_ID_1, 0));
+      if( joy1_center_y < 0 ) joy1_center_y = v;
+      joystick1y = scale_joystick_pot(v, joy1_center_y);
+      // set ADC to read AN0 input (joystick 2, x axis)
+      PLIB_ADC_MuxChannel0InputPositiveSelect(ADC_ID_1, ADC_MUX_A, ADC_INPUT_POSITIVE_AN0);
+      PLIB_ADC_SamplingStart(ADC_ID_1);
+      break;
                    
-        case 3: 
-          // read joystick 2, x axis, initialize center on first read
-          v = rolling_average(2, PLIB_ADC_ResultGetByIndex(ADC_ID_1, 0));
-          if( joy2_center_x < 0 ) joy2_center_x = v;
-          x2 = scale_joystick_pot(v, joy2_center_x);
-          // set ADC to read AN1 input (joystick 2, y axis)
-          PLIB_ADC_MuxChannel0InputPositiveSelect(ADC_ID_1, ADC_MUX_A, ADC_INPUT_POSITIVE_AN1);
-          PLIB_ADC_SamplingStart(ADC_ID_1);
-          m++;
-          break;
+    case 3: 
+      // read joystick 2, x axis, initialize center on first read
+      v = rolling_average(2, PLIB_ADC_ResultGetByIndex(ADC_ID_1, 0));
+      if( joy2_center_x < 0 ) joy2_center_x = v;
+      joystick2x = scale_joystick_pot(v, joy2_center_x);
+      // set ADC to read AN1 input (joystick 2, y axis)
+      PLIB_ADC_MuxChannel0InputPositiveSelect(ADC_ID_1, ADC_MUX_A, ADC_INPUT_POSITIVE_AN1);
+      PLIB_ADC_SamplingStart(ADC_ID_1);
+      break;
                    
-        case 4: 
-          // read joystick 2, y axis, initialize center on first read
-          v = rolling_average(3, PLIB_ADC_ResultGetByIndex(ADC_ID_1, 0));
-          if( joy2_center_y < 0 ) joy2_center_y = v;
-          y2 = scale_joystick_pot(v, joy2_center_y);
-          m++;
-          break;
+    case 4: 
+      // read joystick 2, y axis, initialize center on first read
+      v = rolling_average(3, PLIB_ADC_ResultGetByIndex(ADC_ID_1, 0));
+      if( joy2_center_y < 0 ) joy2_center_y = v;
+      joystick2y = scale_joystick_pot(v, joy2_center_y);
+      break;
                    
-        case 5: 
-          {
-            // read joystick buttons
-            uint8_t b = read_joystick_buttons();
-            b1 = b & 0x0f;
-            b2 = b / 16;
-            m++;
-            break;
-          }
-              
-        case 6: 
-          {
-            // check if there are any any changes for joystick 1
-            if( x1!=x1p || y1!=y1p || b1 != b1p )
-              {
-                // send joystick 1 data
-                static uint8_t buf[3];
-                buf[0] = DAZ_JOY1 | b1;
-                buf[1] = x1;
-                buf[2] = y1;
-                dazzler_send(buf, 3);
-
-                // remember current values
-                x1p = x1; y1p = y1; b1p = b1;
-              }
-
-            // draw calibration info if in calibration mode
-            if( test_mode==1 ) 
-              {
-                draw_joystick_pixel(x1, y1);
-                draw_joystick_buttons(b1);
-              }
- 
-            m++;
-            break;
-          }
-          
-        case 7:
-          {
-            // check if there are any any changes for joystick 2
-            if( x2!=x2p || y2!=y2p || b2 != b2p )
-              {
-                // send joystick 2 data
-                static uint8_t buf[3];
-                buf[0] = DAZ_JOY2 | b2;
-                buf[1] = x2;
-                buf[2] = y2;
-                dazzler_send(buf, 3);
-
-                // remember current values
-                x2p = x2; y2p = y2; b2p = b2;
-              }
-
-            // draw calibration info if in calibration mode
-            if( test_mode==2 ) 
-              {
-                draw_joystick_pixel(x2, y2);
-                draw_joystick_buttons(b2);
-              }
-          
-            m=0;
-            break;
-          }
-        }
+    case 5: 
+      // read joystick buttons
+      v = read_joystick_buttons();
+      joystick1b = v & 0x0f;
+      joystick2b = v / 16;
+      // done reading joystick data
+      joystick_read_done = 1;
+      break;
     }
+  
+}
+
+
+void handle_joystick()
+{
+  int buflen = 0;
+  static uint8_t buf[6];
+  static int x1p = ~0, y1p = ~0, x2p = ~0, y2p = ~0, b1p = 0, b2p = 0;
+
+  // see if there are any any changes for joystick 1
+  if( joystick1x!=x1p || joystick1y!=y1p || joystick1b != b1p )
+    {
+      // send joystick 1 data
+      buf[buflen++] = DAZ_JOY1 | joystick1b;
+      buf[buflen++] = joystick1x;
+      buf[buflen++] = joystick1y;
+      
+      // draw calibration info if in calibration mode
+      if( test_mode==1 ) 
+        {
+          draw_joystick_pixel(joystick1x, joystick1y);
+          draw_joystick_buttons(joystick1b);
+        }
+
+      // remember current values
+      x1p = joystick1x; y1p = joystick1y; b1p = joystick1b;
+    }
+  
+  // see if there are any any changes for joystick 2
+  if( joystick2x!=x2p || joystick2y!=y2p || joystick2b != b2p )
+    {
+      // send joystick 2 data
+      buf[buflen++] = DAZ_JOY2 | joystick2b;
+      buf[buflen++] = joystick2x;
+      buf[buflen++] = joystick2y;
+
+      // draw calibration info if in calibration mode
+      if( test_mode==2 ) 
+        {
+          draw_joystick_pixel(joystick2x, joystick2y);
+          draw_joystick_buttons(joystick2b);
+        }
+
+      // remember current values
+      x2p = joystick2x; y2p = joystick2y; b2p = joystick2b;
+    }
+
+  // send joystick update (if any)
+  if( buflen>0 ) dazzler_send(buf, buflen);
 }
 
 
@@ -828,7 +998,7 @@ void __ISR(_TIMER_2_VECTOR, ipl7AUTO) IntHandlerTimer2(void)
       uint8_t *ptr = linebuffer + (((g_current_line-VBP_LENGTH)>>repeat_line)&3) * LL;
       uint8_t *end = ptr + 129;
 
-      if( dazzler_ctrl & 0x80 )
+      //if( dazzler_ctrl & 0x80 )
         // The assembly code below outputs the pixels at roughly a
         // 9.7MHz rate (pixel clock). The loop is just the same as the
         // following C code: while( ptr!=end ) LATB = *ptr++;
@@ -866,6 +1036,12 @@ void __ISR(_TIMER_2_VECTOR, ipl7AUTO) IntHandlerTimer2(void)
       PLIB_OC_ModeSelect(OC_ID_3, OC_SET_LOW_SINGLE_PULSE_MODE);
       PLIB_OC_Enable(OC_ID_3);
     }
+  else if( g_current_line<6 )
+    {
+      // during the first six lines of the vertical back porch (blanking period)
+      // do one "joystick action" per scan line
+      read_joystick(g_current_line);
+    }
   
   if( g_current_line>=VBP_LENGTH-8 && g_current_line<VBP_LENGTH+DISPLAY_LINES-8 )
     {
@@ -883,6 +1059,7 @@ void __ISR(_TIMER_2_VECTOR, ipl7AUTO) IntHandlerTimer2(void)
       // ...
       uint32_t line = g_current_line - VBP_LENGTH + 8;
       render_line((line>>(repeat_line+1))&1, line/4, line&7);
+
 #if SHOW_RINGBUFFER>0
       if( line==7 )
         {
@@ -912,7 +1089,7 @@ void __ISR(_TIMER_2_VECTOR, ipl7AUTO) IntHandlerTimer2(void)
     memcpy(dazzler_mem_buf, dazzler_mem + (dazzler_ctrl & 1) * 2048, 1024);
   else if( g_current_line==NUM_LINES-2)
     memcpy(dazzler_mem_buf + 1024, dazzler_mem + (dazzler_ctrl & 1) * 2048 + 1024, 1024);
-  
+      
   // increase line counter and roll over when we reach the bottom of the screen
   if( ++g_current_line==NUM_LINES ) 
     { 
@@ -932,13 +1109,44 @@ void __ISR(_TIMER_2_VECTOR, ipl7AUTO) IntHandlerTimer2(void)
       // set the common foreground color for next frame
       dazzler_fg_color = dazzler_picture_ctrl & 0x0F;
  }
+  
+#if HAVE_AUDIO  
+  // play next audio samples
+  g_audio_sample_ctr++;
+          
+  if( g_audio_sample_ctr>=g_next_audio_sample[0] )
+    {
+      PLIB_OC_PulseWidth16BitSet(OC_ID_2, g_next_audio_sample_val[0]); 
+      if( audiobuffer_empty(0) )
+        g_next_audio_sample[0] = 0xffffffff;
+      else
+      {
+        uint32_t data = audiobuffer_dequeue(0);
+        g_next_audio_sample[0] = g_audio_sample_ctr+(data/256);
+        g_next_audio_sample_val[0] = data & 0xff;
+      }
+    }
 
+  if( g_audio_sample_ctr>=g_next_audio_sample[1] )
+    {
+      PLIB_OC_PulseWidth16BitSet(OC_ID_5, g_next_audio_sample_val[1]); 
+      if( audiobuffer_empty(1) )
+        g_next_audio_sample[1] = 0xffffffff;
+      else
+      {
+        uint32_t data = audiobuffer_dequeue(1);
+        g_next_audio_sample[1] = g_audio_sample_ctr+(data/256);
+        g_next_audio_sample_val[1] = data & 0xff;
+      }
+    }
+#endif
+  
   // allow next interrupt
   PLIB_INT_SourceFlagClear(INT_ID_0,INT_SOURCE_TIMER_2);
 }
 
 
-void __ISR(_OUTPUT_COMPARE_2_VECTOR, ipl6AUTO) IntHandlerOC2(void)
+void __ISR(_OUTPUT_COMPARE_4_VECTOR, ipl6AUTO) IntHandlerOC4(void)
 {
   // This interrupt occurs a few cycles before the timer2 interrupt
   // and its purpose is to put the CPU in a defined state that allows
@@ -957,7 +1165,7 @@ void __ISR(_OUTPUT_COMPARE_2_VECTOR, ipl6AUTO) IntHandlerOC2(void)
   asm volatile("\tnop\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop\n");
   asm volatile("\tnop\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop\n");
 #endif
-  PLIB_INT_SourceFlagClear(INT_ID_0,INT_SOURCE_OUTPUT_COMPARE_2);
+  PLIB_INT_SourceFlagClear(INT_ID_0,INT_SOURCE_OUTPUT_COMPARE_4);
 }
 
     
@@ -1028,8 +1236,8 @@ USB_HOST_CDC_EVENT_RESPONSE USBHostCDCEventHandler(USB_HOST_CDC_HANDLE cdcHandle
         usbScheduleRead();
         break;
       }
-        
-    case USB_HOST_CDC_EVENT_DEVICE_DETACHED:
+
+      case USB_HOST_CDC_EVENT_DEVICE_DETACHED:
       {
         // USB_HOST_CDC_Close(usbCdcHostHandle);
         usbCdcObject = NULL;
@@ -1051,6 +1259,8 @@ void USBHostCDCAttachEventListener(USB_HOST_CDC_OBJ cdcObj, uintptr_t context)
 
 void usbTasks()
 {
+  static bool lineStateSet = false;
+  
   if( usbCdcHostHandle==USB_HOST_CDC_HANDLE_INVALID )
     {
       if( usbCdcObject!=NULL )
@@ -1072,13 +1282,19 @@ void usbTasks()
               // https://github.com/arduino/ArduinoCore-avr/issues/296
               static USB_CDC_LINE_CODING coding = {115200, 0, 0, 8};
               USB_HOST_CDC_ACM_LineCodingSet(usbCdcHostHandle, NULL, &coding);
-
+              
               // initialize ringbuffer
               ringbuffer_start = ringbuffer_end = 0;
               computer_version = 0;
+              lineStateSet = false;
               usbBusy = false;
             }
         }
+    }
+  else if( !lineStateSet )
+    {
+      USB_CDC_CONTROL_LINE_STATE state = {1, 1};
+      lineStateSet = USB_HOST_CDC_ACM_ControlLineStateSet(usbCdcHostHandle, NULL, &state)==USB_HOST_RESULT_SUCCESS;
     }
   else
     {
@@ -1113,6 +1329,13 @@ void APP_Initialize ( void )
 {
   int r, c, q;
 
+#if HAVE_AUDIO>0
+  // without audio (default), PB4 is output (ButtonsShift)
+  // if audio is enabled PB4 is input (TestButton)
+  PLIB_PORTS_PinDirectionInputSet(PORTS_ID_0, PORT_CHANNEL_B, PORTS_BIT_POS_4);
+  PLIB_PORTS_ChangeNoticePullUpPerPortEnable(PORTS_ID_0, PORT_CHANNEL_B, PORTS_BIT_POS_4);
+#endif
+  
   // set CPU to switch into IDLE mode when executing "wait" instruction
   SYS_DEVCON_SystemUnlock();
   PLIB_OSC_OnWaitActionSet(OSC_ID_0, OSC_ON_WAIT_IDLE);
@@ -1133,6 +1356,7 @@ void APP_Initialize ( void )
   PLIB_INT_SourceEnable(INT_ID_0, INT_SOURCE_TIMER_2);
     
   // set up output compare for HSYNC signal
+  PLIB_PORTS_RemapOutput(PORTS_ID_0, OUTPUT_FUNC_OC1, OUTPUT_PIN_RPB7);
   PLIB_OC_ModeSelect(OC_ID_1, OC_DUAL_COMPARE_CONTINUOUS_PULSE_MODE);
   PLIB_OC_BufferSizeSelect(OC_ID_1, OC_BUFFER_SIZE_16BIT);
   PLIB_OC_TimerSelect(OC_ID_1, OC_TIMER_16BIT_TMR2);
@@ -1141,18 +1365,41 @@ void APP_Initialize ( void )
   PLIB_OC_Enable(OC_ID_1);
     
   // set up output compare + interrupt for going into idle mode
-  // (see comment in ISR function IntHandlerOC2)
-  PLIB_INT_VectorPrioritySet(INT_ID_0, INT_VECTOR_OC2, INT_PRIORITY_LEVEL6);
-  PLIB_INT_VectorSubPrioritySet(INT_ID_0, INT_VECTOR_OC2, INT_SUBPRIORITY_LEVEL0);
-  PLIB_INT_SourceFlagClear(INT_ID_0, INT_SOURCE_OUTPUT_COMPARE_2);
-  PLIB_INT_SourceEnable(INT_ID_0, INT_SOURCE_OUTPUT_COMPARE_2);
-  PLIB_OC_ModeSelect(OC_ID_2, OC_TOGGLE_CONTINUOUS_PULSE_MODE);
+  // (see comment in ISR function IntHandlerOC4)
+  PLIB_INT_VectorPrioritySet(INT_ID_0, INT_VECTOR_OC4, INT_PRIORITY_LEVEL6);
+  PLIB_INT_VectorSubPrioritySet(INT_ID_0, INT_VECTOR_OC4, INT_SUBPRIORITY_LEVEL0);
+  PLIB_INT_SourceFlagClear(INT_ID_0, INT_SOURCE_OUTPUT_COMPARE_4);
+  PLIB_INT_SourceEnable(INT_ID_0, INT_SOURCE_OUTPUT_COMPARE_4);
+  PLIB_OC_ModeSelect(OC_ID_4, OC_TOGGLE_CONTINUOUS_PULSE_MODE);
+  PLIB_OC_BufferSizeSelect(OC_ID_4, OC_BUFFER_SIZE_16BIT);
+  PLIB_OC_TimerSelect(OC_ID_4, OC_TIMER_16BIT_TMR2);
+  PLIB_OC_Buffer16BitSet(OC_ID_4, NUM_PIXELS-20);
+  PLIB_OC_Enable(OC_ID_4);
+
+#if HAVE_AUDIO>0  
+  // set up timer and output compare for dual 8-bit PWM audio output at 94kHz
+  PLIB_TMR_ClockSourceSelect(TMR_ID_3, TMR_CLOCK_SOURCE_PERIPHERAL_CLOCK );
+  PLIB_TMR_PrescaleSelect(TMR_ID_3, TMR_PRESCALE_VALUE_1);
+  PLIB_TMR_Period16BitSet(TMR_ID_3, 254);
+  PLIB_TMR_Mode16BitEnable(TMR_ID_3);
+  PLIB_TMR_Counter16BitClear(TMR_ID_3);
+  PLIB_TMR_Start(TMR_ID_3);
+  PLIB_PORTS_RemapOutput(PORTS_ID_0, OUTPUT_FUNC_OC2, OUTPUT_PIN_RPB8 );
+  PLIB_OC_ModeSelect(OC_ID_2, OC_COMPARE_PWM_MODE_WITHOUT_FAULT_PROTECTION);
   PLIB_OC_BufferSizeSelect(OC_ID_2, OC_BUFFER_SIZE_16BIT);
-  PLIB_OC_TimerSelect(OC_ID_2, OC_TIMER_16BIT_TMR2);
-  PLIB_OC_Buffer16BitSet(OC_ID_2, NUM_PIXELS-20);
+  PLIB_OC_TimerSelect(OC_ID_2, OC_TIMER_16BIT_TMR3);
+  PLIB_OC_PulseWidth16BitSet(OC_ID_2, 0); 
   PLIB_OC_Enable(OC_ID_2);
-    
+  PLIB_PORTS_RemapOutput(PORTS_ID_0, OUTPUT_FUNC_OC5, OUTPUT_PIN_RPB13 );
+  PLIB_OC_ModeSelect(OC_ID_5, OC_COMPARE_PWM_MODE_WITHOUT_FAULT_PROTECTION);
+  PLIB_OC_BufferSizeSelect(OC_ID_5, OC_BUFFER_SIZE_16BIT);
+  PLIB_OC_TimerSelect(OC_ID_5, OC_TIMER_16BIT_TMR3);
+  PLIB_OC_PulseWidth16BitSet(OC_ID_5, 0); 
+  PLIB_OC_Enable(OC_ID_5);
+#endif
+  
   // set up output compare for VSYNC signal
+  PLIB_PORTS_RemapOutput(PORTS_ID_0, OUTPUT_FUNC_OC3, OUTPUT_PIN_RPB9 );
   PLIB_OC_BufferSizeSelect(OC_ID_3, OC_BUFFER_SIZE_16BIT);
   PLIB_OC_TimerSelect(OC_ID_3, OC_TIMER_16BIT_TMR2);
   PLIB_OC_Buffer16BitSet(OC_ID_3, 0);
@@ -1168,7 +1415,7 @@ void APP_Initialize ( void )
   // disable USB peripheral (was enabled in DRV_USBFS_Initialize() called from system_init.c)
   PLIB_USB_Disable(USB_ID_1);
 
-  // set up USART 2 on pins 21/22 (B10/B11) at 750000 baud, 8N1
+  // set up USART 2 on pins 21/22 (JOYSTICK1B0/JOYSTICK1B1) at 750000 baud, 8N1
   c = SYS_CLK_PeripheralFrequencyGet(CLK_BUS_PERIPHERAL_1);
   PLIB_PORTS_PinModePerPortSelect(PORTS_ID_0, PORT_CHANNEL_B, 10, PORTS_PIN_MODE_DIGITAL);
   PLIB_PORTS_PinModePerPortSelect(PORTS_ID_0, PORT_CHANNEL_B, 11, PORTS_PIN_MODE_DIGITAL);
@@ -1189,9 +1436,6 @@ void APP_Initialize ( void )
   USB_HOST_BusEnable(0);
 #endif
 
-  // clear line rendering buffer
-  memset(linebuffer, 0, sizeof(linebuffer));
-    
   // determine whether to enter joystick calibration (test) mode
   test_mode = read_joystick_buttons();
   if( (test_mode & 0x0f)!=0x0f )
@@ -1200,13 +1444,16 @@ void APP_Initialize ( void )
     test_mode = 2;
   else if( !TestButtonStateGet() )
     test_mode = 15;
-  else 
+  else
     test_mode = 0;
 
+  // clear line rendering buffer
+  memset(linebuffer, 0, sizeof(linebuffer));
+    
   // if we're in test mode, draw the test screen
   if( test_mode>0 ) { dazzler_ctrl = 0x80; draw_test_screen(); }
     
-  // start timer
+  // start HSYNC timer
   if( ALWAYS_ON>0 || test_mode>0 ) PLIB_TMR_Start(TMR_ID_2);
 }
 
@@ -1218,8 +1465,8 @@ void APP_Initialize ( void )
 
 void APP_Tasks ( void )
 {
-  // query joystick (in first 7 lines of the vertical back porch)
-  check_joystick();
+  // handle joystick updates
+  if( joystick_read_done ) { handle_joystick(); joystick_read_done = false; }
 
   // process received data    
   ringbuffer_process_data();
@@ -1246,6 +1493,13 @@ void APP_Tasks ( void )
      send_vsync = false;
   }
   
-  // handle test mode switching
-  check_test_button();
+  if( test_mode>10 ) 
+  {
+    // handle test mode switching
+    check_test_button();
+#if HAVE_AUDIO>0
+    test_audio(0, joystick2b, joystick2x, joystick2y);
+    test_audio(1, joystick1b, joystick1x, joystick1y);
+#endif
+  }
 }
