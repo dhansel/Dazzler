@@ -1170,20 +1170,23 @@ void adjust_render_area_size(HWND hwnd)
           // virtual width ov window
           if (g_aspect_ratio == ASPECT_43) width = (width * 3) / 4;
 
-          // fix maximum virtual width or height to 128 pixels and scale 
-          // other dimension according to current window width:height ratio
-          // this will scale up the pixel size
-          if( width<height )
+          if( width>0 && height>0)
             {
-              height = (height * P_PIXEL_SIZE * 128) / width;
-              width  = P_PIXEL_SIZE*128;
+              // fix maximum virtual width or height to 128 pixels and scale 
+              // other dimension according to current window width:height ratio
+              // this will scale up the pixel size
+              if (width < height)
+                {
+                  height = (height * P_PIXEL_SIZE * 128) / width;
+                  width = P_PIXEL_SIZE * 128;
+                }
+              else
+                {
+                  width = (width * P_PIXEL_SIZE * 128) / height;
+                  height = P_PIXEL_SIZE * 128;
+                }
             }
-          else
-            {
-              width = (width * P_PIXEL_SIZE * 128) / height;
-              height = P_PIXEL_SIZE*128;
-            }
-
+              
           // set virtual width of render area
           pRenderTarget->Resize(D2D1::SizeU(width, height));
 
