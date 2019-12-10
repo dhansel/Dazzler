@@ -17,4 +17,4 @@ joystick-pcb-gerber.zip  | Gerber file for PCB manufacturing
 [joystick.jpg](joystick.jpg)              | Picture of fully assembled board
 .| **Other**
 [BOM.csv](BOM.csv)                   | Bill of materials (BOM) for main board and two joysticks
-[dazzler+joystick.jpg](dazzler+joystick.jpg)      | Picture of assembled main board and two joysticks
+[dazzler+joysticks.jpg](dazzler+joysticks.jpg)      | Picture of assembled main board and two joysticks
