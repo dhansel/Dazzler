@@ -53,19 +53,6 @@
 // blank period (during which the RGBI outputs are not used).
 #define HAVE_AUDIO 1
 
-inline void ColorBlip(int n)
-{
-#if 1
-   int i, j;
-   for(j=0; j<n; j++)
-   {   
-   ColorToggle();
-   for(i=0; i<3; i++) asm volatile("nop");
-   ColorToggle();
-   for(i=0; i<3; i++) asm volatile("nop");
-   }
-#endif
-}
 
 // The following Microchip USB host stack source files have been modified from their original:
 //
@@ -302,7 +289,6 @@ uint8_t ringbuffer_process_data()
           {
             if( available>=4 )
               {
-                //ColorBlip(2);
                 static int remainder[2] = {0, 0};
                 int N = (cmd&0x0f)==0 ? 0 : 1;
                 ringbuffer_dequeue();
