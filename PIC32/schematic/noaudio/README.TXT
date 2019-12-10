@@ -1,0 +1,1 @@
+These are the schematics of the previous version without audio support.
