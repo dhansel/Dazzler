@@ -1,0 +1,52 @@
+﻿Main PCB,,,,,
+,,,,,
+Designator,Name,Quantity,Supplier,Supplier Part,Verified
+"C1,C2",22pF,2,LCSC,C260725,
+C3,10uF,1,LCSC,C28244,
+"C4,C5,C7,C9,C14,C16",100nF,6,LCSC,C154503,*
+C6,10uF,1,LCSC,C235682,*
+"C8,C15",220nF,2,LCSC,C94715,
+"C11,C10,C12,C13",470nF,4,LCSC,C341275,
+"D5,D6,D7,D8",1N4148,4,LCSC,C14516,
+IC1,PIC32MX250F128B,1,DigiKey,PIC32MX250F128B-I/SP-ND,
+IC2,74HC08AN,1,LCSC,C2887,*
+IC3,74HC4053,1,DigiKey,CD74HC4053EG4-ND,
+IC4,74HC165N,1,LCSC,C2909,*
+IC5,MCP1700-330,1,DigiKey,MCP1700-3302E/TO,
+ICSP,PICKIT3 ICSP Header,1,LCSC,C225492,*
+"Test,Reset",Test/Reset Button,2,LCSC,C110153,*
+"L1,L2,L3,L4",470uH,4,DigiKey,M10142-ND,
+LED1,Power LED,1,LCSC,C99772,
+Q1,8MHz crystal,1,LCSC,C188205,*
+"R1,R2,R3,R4,R5,R6,R7,R8,R10,R22",10kΩ,8,LCSC,C61299,
+R11,4.7kΩ,1,LCSC,C120071,
+"R12,R13,R14",220Ω,3,LCSC,C61289,
+"R15,R16,R17",470Ω,3,LCSC,C120047,
+"R18,R25",150Ω,2,LCSC,C70814,
+R19,330Ω,1,LCSC,C120043,
+R20,680Ω,1,LCSC,C70784,
+R21,75Ω,1,LCSC,C70779,
+R24,1kΩ,1,LCSC,C120055,
+"R9,R23",5.1kΩ,2,LCSC,C120072,
+USB,USB Connector (female),1,LCSC,C2344,*
+VGA,VGA Connector (female),1,LCSC,C379814,*
+Audio,Audio connector (3.5mm),1,LCSC,C136686,*
+"JOYSTICK1,JOYSTICK2",DB9 connector (female),2,LCSC,C141882,*
+DIP-14,DIP-14 socket,1,LCSC,C132508 ,*
+DIP-16,DIP-16 socket,2,LCSC,C146580 ,*
+DIP-28,DIP-28 socket,1,LCSC,C146582 ,*
+,,,,,
+2x Joystick PCB,,,,,
+,,,,,
+Designator,Name,Quantity,Supplier,Supplier Part,
+Joystick,Thumb Joystick,2,DigiKey,1568-1526-ND,
+"B1,B2,B3,B4",Buttons,8,LCSC,C110153,*
+"C1,C2",100nF,4,LCSC,C154503,*
+P1,IDC connector 2x4 male,2,LCSC,C9135 ,*
+,,,,,
+2x Joystick connection cable,,,,,
+,,,,,
+Designator,Name,Quantity,Supplier,Supplier Part,
+IDC connector 2x4 (female),,2,LCSC,C21851 ,*
+DB9 connector (male),,2,DigiKey,HMM09H-ND,
+8-conductor ribbon cable (5 feet),,2,DigiKey,3M156817-5-ND,
