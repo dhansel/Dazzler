@@ -984,7 +984,7 @@ void __ISR(_TIMER_2_VECTOR, ipl7AUTO) IntHandlerTimer2(void)
       uint8_t *ptr = linebuffer + (((g_current_line-VBP_LENGTH)>>repeat_line)&3) * LL;
       uint8_t *end = ptr + 129;
 
-      //if( dazzler_ctrl & 0x80 )
+      if( dazzler_ctrl & 0x80 )
         // The assembly code below outputs the pixels at roughly a
         // 9.7MHz rate (pixel clock). The loop is just the same as the
         // following C code: while( ptr!=end ) LATB = *ptr++;
