@@ -5,4 +5,5 @@ Simulator distribution.
 
 FELIX.DSK also boots into CP/M and contains the Felix computer 
 graphics animation system for the Dazzler. For more information 
-see the README.TXT, ABSTRACT.035 and FELIX.DOC files on the disk.
+see ../doc/Felix.txt as well as  README.TXT and ABSTRACT.035 
+on the disk.
